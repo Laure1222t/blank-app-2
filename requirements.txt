@@ -5,4 +5,5 @@ dashscope==1.14.0
 PyMuPDF==1.23.18  # 用于PDF处理
 pytesseract==0.3.10  # OCR识别库
 Pillow==10.2.0  # 图像处理库
+numpy==1.26.4  # 用于图像处理辅助
     
