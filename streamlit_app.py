@@ -55,6 +55,10 @@ st.markdown("""
         border-radius: 3px;
         background-color: #f0f2f6;
     }
+    .parse-status {
+        font-size: 0.9rem;
+        color: #6c757d;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -69,13 +73,15 @@ if 'api_key' not in st.session_state:
     st.session_state.api_key = os.getenv("QWEN_API_KEY", "")
 if 'max_clauses' not in st.session_state:
     st.session_state.max_clauses = 30  # 默认最大条款数
+if 'parse_method' not in st.session_state:
+    st.session_state.parse_method = "智能识别"  # 解析方法
 
 # 页面标题
 st.title("📜 多文件政策比对分析工具")
 st.markdown("上传目标政策文件和多个待比对文件，系统将逐一进行条款比对与合规性分析")
 st.markdown("---")
 
-# 条款数量设置
+# 条款提取设置
 st.sidebar.subheader("条款提取设置")
 st.session_state.max_clauses = st.sidebar.slider(
     "最大条款数量", 
@@ -93,6 +99,13 @@ clause_precision = st.sidebar.select_slider(
     help="设置条款拆分的精细程度，精细模式会识别更多子条款"
 )
 
+# 解析方法选择
+st.session_state.parse_method = st.sidebar.radio(
+    "解析方法",
+    ["智能识别", "按标题层级", "按段落拆分"],
+    help="当智能识别效果不佳时，可尝试其他解析方法"
+)
+
 # API配置
 with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
     st.session_state.api_key = st.text_input("请输入Qwen API密钥", value=st.session_state.api_key, type="password")
@@ -103,73 +116,169 @@ with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
     )
     st.caption("提示：可从阿里云DashScope平台获取API密钥，不同模型能力和成本不同")
 
-# 优化的PDF解析函数 - 更细致的条款拆分
-def parse_pdf(file, max_clauses=30, precision="中等"):
-    """解析PDF文件并提取结构化条款，支持不同精细度"""
+# 优化的PDF解析函数 - 解决解析不完全问题
+def parse_pdf(file, max_clauses=30, precision="中等", method="智能识别"):
+    """解析PDF文件并提取结构化条款，优化解析完整性"""
     try:
         with st.spinner("正在解析文件..."):
             doc = fitz.open(stream=file.read(), filetype="pdf")
+            total_pages = len(doc)
             text = ""
-            for page in doc:
-                text += page.get_text()
+            page_texts = []  # 存储每页的文本，用于处理跨页条款
             
-            # 清理文本
-            text = re.sub(r'\s+', ' ', text).strip()
-            text = re.sub(r'(\r\n|\r|\n)', ' ', text)
-            text = re.sub(r'(\s\s+)', ' ', text)
+            # 逐页读取文本，保留页面分隔信息
+            for page_num, page in enumerate(doc, 1):
+                page_text = page.get_text()
+                page_texts.append(f"[[PAGE {page_num}]]\n{page_text}")
+                text += page_text + "\n\n"
             
-            # 根据精细度选择不同的条款提取模式
-            patterns = []
+            # 文本预处理 - 增强版
+            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)  # 移除控制字符
+            text = re.sub(r'(\r\n|\r|\n)+', '\n', text)  # 统一换行符
+            text = re.sub(r'[^\S\n]+', ' ', text)  # 替换非换行的空白字符为空格
+            text = text.strip()
             
-            if precision == "精细":
-                # 精细模式：识别多级条款，包括带括号的编号
-                patterns = [
-                    re.compile(r'(\d+\.\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\.\d+\s+|$)', re.DOTALL),  # 四级条款
-                    re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|$)', re.DOTALL),          # 三级条款
-                    re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级条款
-                    re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级数字条款
-                    re.compile(r'([一二三四五六七八九十]+\.\s+.*?)(?=[一二三四五六七八九十]+\.\s+|$)', re.DOTALL),  # 中文数字条款
-                    re.compile(r'(\([一二三四五六七八九十]\)\s+.*?)(?=\([一二三四五六七八九十]\)\s+|$)', re.DOTALL),  # 带括号中文条款
-                    re.compile(r'([A-Za-z]\.\s+.*?)(?=[A-Za-z]\.\s+|$)', re.DOTALL)               # 字母编号条款
-                ]
-            elif precision == "中等":
-                # 中等模式：识别主要层级条款
-                patterns = [
-                    re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|$)', re.DOTALL),          # 三级条款
-                    re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级条款
-                    re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级数字条款
-                    re.compile(r'([一二三四五六七八九十]+\.\s+.*?)(?=[一二三四五六七八九十]+\.\s+|$)', re.DOTALL)   # 中文数字条款
-                ]
-            else:  # 粗略
-                # 粗略模式：只识别主要条款
-                patterns = [
-                    re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级条款
-                    re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级数字条款
-                    re.compile(r'([一二三四五六七八九十]+\.\s+.*?)(?=[一二三四五六七八九十]+\.\s+|$)', re.DOTALL)   # 中文数字条款
-                ]
-            
+            # 根据选择的解析方法处理
             clauses = []
-            for pattern in patterns:
-                matches = pattern.findall(text)
-                if matches:
-                    # 过滤过短的条款
-                    clauses = [match.strip() for match in matches if len(match.strip()) > 20]
-                    break
             
-            # 如果没有识别到条款格式，按段落分割
-            if not clauses:
-                # 使用句号和换行分割段落
-                paragraphs = re.split(r'。(?=\s|$)|(?<=\s)。', text)
-                paragraphs = [p.strip() + '。' for p in paragraphs if len(p.strip()) > 50]
-                clauses = paragraphs
+            if method == "智能识别":
+                # 智能识别模式 - 尝试多种模式
+                clauses = parse_with_patterns(text, precision)
+                # 如果提取的条款太少，尝试其他模式补充
+                if len(clauses) < 5:
+                    st.markdown('<p class="parse-status">智能识别提取条款较少，尝试补充提取...</p>', unsafe_allow_html=True)
+                    heading_clauses = parse_by_headings(text)
+                    # 合并条款并去重
+                    combined = list(clauses)
+                    for clause in heading_clauses:
+                        if clause not in combined:
+                            combined.append(clause)
+                    clauses = combined
+            
+            elif method == "按标题层级":
+                # 按标题层级解析
+                clauses = parse_by_headings(text)
+            
+            else:  # 按段落拆分
+                # 按段落拆分模式
+                clauses = parse_by_paragraphs(text)
+            
+            # 后处理：过滤过短条款和空白条款
+            clauses = [clause.strip() for clause in clauses if clause.strip() and len(clause.strip()) > 30]
+            
+            # 处理跨页条款（简单合并可能被分页符分割的条款）
+            if len(clauses) > 1:
+                merged_clauses = []
+                i = 0
+                while i < len(clauses):
+                    # 检查是否包含页码标记，且不是最后一条
+                    if "[[PAGE" in clauses[i] and i < len(clauses) - 1:
+                        # 合并当前条款和下一条款
+                        merged = clauses[i] + " " + clauses[i+1]
+                        merged = re.sub(r'\[\[PAGE \d+\]\]', '', merged)  # 移除页码标记
+                        merged_clauses.append(merged)
+                        i += 2  # 跳过下一条
+                    else:
+                        # 移除页码标记
+                        clean_clause = re.sub(r'\[\[PAGE \d+\]\]', '', clauses[i])
+                        merged_clauses.append(clean_clause)
+                        i += 1
+                clauses = merged_clauses
             
             # 应用最大条款数限制
             max_clauses = min(max_clauses, 50) if max_clauses > 0 else 50
-            return clauses[:max_clauses]
+            final_clauses = clauses[:max_clauses]
+            
+            # 显示解析状态
+            st.markdown(f'<p class="parse-status">共解析 {total_pages} 页，提取 {len(final_clauses)} 条有效条款</p>', unsafe_allow_html=True)
+            return final_clauses
             
     except Exception as e:
         st.error(f"文件解析错误: {str(e)}")
         return []
+
+# 按模式识别条款
+def parse_with_patterns(text, precision):
+    # 根据精细度选择不同的条款提取模式
+    patterns = []
+    
+    if precision == "精细":
+        # 精细模式：识别更多类型的条款
+        patterns = [
+            # 数字编号条款（支持多级）
+            re.compile(r'(\d+\.\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\.\d+\s+|$)', re.DOTALL),  # 四级
+            re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|$)', re.DOTALL),          # 三级
+            re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级
+            re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级
+            
+            # 中文编号条款
+            re.compile(r'([一二三四五六七八九十百]+\.\s+.*?)(?=[一二三四五六七八九十百]+\.\s+|$)', re.DOTALL),  # 中文数字
+            re.compile(r'(\([一二三四五六七八九十]\)\s+.*?)(?=\([一二三四五六七八九十]\)\s+|$)', re.DOTALL),  # 带括号中文
+            re.compile(r'([甲乙丙丁戊己庚辛壬癸]+\.\s+.*?)(?=[甲乙丙丁戊己庚辛壬癸]+\.\s+|$)', re.DOTALL),  # 天干
+            
+            # 字母编号条款
+            re.compile(r'([A-Z]\.\s+.*?)(?=[A-Z]\.\s+|$)', re.DOTALL),                    # 大写字母
+            re.compile(r'([a-z]\.\s+.*?)(?=[a-z]\.\s+|$)', re.DOTALL),                    # 小写字母
+            re.compile(r'(\([A-Za-z]\)\s+.*?)(?=\([A-Za-z]\)\s+|$)', re.DOTALL)           # 带括号字母
+        ]
+    elif precision == "中等":
+        # 中等模式：识别主要层级条款
+        patterns = [
+            re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|$)', re.DOTALL),          # 三级
+            re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级
+            re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级
+            re.compile(r'([一二三四五六七八九十]+\.\s+.*?)(?=[一二三四五六七八九十]+\.\s+|$)', re.DOTALL),  # 中文数字
+            re.compile(r'([A-Z]\.\s+.*?)(?=[A-Z]\.\s+|$)', re.DOTALL)                     # 大写字母
+        ]
+    else:  # 粗略
+        # 粗略模式：只识别主要条款
+        patterns = [
+            re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级
+            re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级
+            re.compile(r'([一二三四五六七八九十]+\.\s+.*?)(?=[一二三四五六七八九十]+\.\s+|$)', re.DOTALL)   # 中文数字
+        ]
+    
+    clauses = []
+    for pattern in patterns:
+        matches = pattern.findall(text)
+        if matches:
+            # 过滤过短的条款
+            clauses = [match.strip() for match in matches if len(match.strip()) > 20]
+            break
+    
+    return clauses
+
+# 按标题层级解析
+def parse_by_headings(text):
+    # 匹配常见的标题格式
+    heading_patterns = [
+        re.compile(r'(第[一二三四五六七八九十百]+章\s+.*?)(?=第[一二三四五六七八九十百]+章\s+|$)', re.DOTALL),  # 章节
+        re.compile(r'(第[一二三四五六七八九十百]+条\s+.*?)(?=第[一二三四五六七八九十百]+条\s+|$)', re.DOTALL),  # 条
+        re.compile(r'([一二三四五六七八九十]+\、\s+.*?)(?=[一二三四五六七八九十]+\、\s+|$)', re.DOTALL),        # 中文序号加顿号
+    ]
+    
+    for pattern in heading_patterns:
+        matches = pattern.findall(text)
+        if matches and len(matches) > 1:
+            return [match.strip() for match in matches]
+    
+    # 如果没有识别到标题，使用通用模式
+    return re.split(r'(?<=[。；！？])\s+', text)
+
+# 按段落拆分
+def parse_by_paragraphs(text):
+    # 使用多种标点符号作为段落分隔符
+    separators = r'。(?=\s+)|！(?=\s+)|？(?=\s+)|；(?=\s+)|[\n]{2,}'
+    paragraphs = re.split(separators, text)
+    # 过滤过短段落并补充结尾标点
+    processed = []
+    for para in paragraphs:
+        para = para.strip()
+        if len(para) > 50:
+            if not para.endswith(('。', '！', '？', '；', '.')):
+                para += '。'
+            processed.append(para)
+    return processed
 
 # 调用Qwen API进行分析
 def call_qwen_api(prompt, api_key, model="qwen-turbo"):
@@ -300,13 +409,15 @@ with col1:
         st.session_state.target_clauses = parse_pdf(
             target_file, 
             max_clauses=st.session_state.max_clauses,
-            precision=clause_precision
+            precision=clause_precision,
+            method=st.session_state.parse_method
         )
         st.success(f"✅ 解析完成，提取到 {len(st.session_state.target_clauses)} 条条款")
         
         with st.expander(f"查看提取的条款 (共 {len(st.session_state.target_clauses)} 条)"):
             for i, clause in enumerate(st.session_state.target_clauses):
-                st.markdown(f'<div class="clause-item"><strong>条款 {i+1}:</strong> {clause[:150]}...' if len(clause) > 150 else f'<div class="clause-item"><strong>条款 {i+1}:</strong> {clause}</div>', unsafe_allow_html=True)
+                display_text = clause[:150] + "..." if len(clause) > 150 else clause
+                st.markdown(f'<div class="clause-item"><strong>条款 {i+1}:</strong> {display_text}</div>', unsafe_allow_html=True)
     
     # 多文件上传区域
     st.subheader("待比对文件")
@@ -326,7 +437,8 @@ with col1:
                 clauses = parse_pdf(
                     file, 
                     max_clauses=st.session_state.max_clauses,
-                    precision=clause_precision
+                    precision=clause_precision,
+                    method=st.session_state.parse_method
                 )
                 st.session_state.compare_files[file.name] = {
                     "clauses": clauses,
@@ -412,17 +524,25 @@ with col2:
 # 帮助信息
 with st.expander("ℹ️ 使用帮助"):
     st.markdown("""
-    1. 首先上传目标政策文件（左侧）
-    2. 配置Qwen API密钥（首次使用需要）
-    3. 在侧边栏设置条款提取参数：
-       - 最大条款数量：控制从文件中提取的条款总数
-       - 条款拆分精细度：调整条款识别的详细程度
-    4. 上传一个或多个待比对文件（左侧）
-    5. 对每个待比对文件点击"分析"按钮
-    6. 在右侧查看不同文件的分析结果并下载报告
+    ### 提高解析完整性的技巧
+    1. **尝试不同解析方法**：
+       - 智能识别：自动识别多种条款格式（默认）
+       - 按标题层级：优先识别章节、条款等标题结构
+       - 按段落拆分：简单按标点符号拆分文本
     
-    注意：
-    - API调用可能产生费用，请参考阿里云DashScope平台定价
-    - 分析结果取决于文件质量和条款清晰度
-    - 精细模式可能提取更多子条款，但也可能产生重复或错误
+    2. **调整精细度**：
+       - 复杂文件建议使用"精细"模式
+       - 结构简单的文件可使用"粗略"模式提高效率
+    
+    3. **其他建议**：
+       - 确保PDF文件可复制（非图片扫描件）
+       - 若文件加密，请先解密再上传
+       - 对于特别长的文件，可适当增加最大条款数量
+    
+    ### 基本使用流程
+    1. 上传目标政策文件和待比对文件
+    2. 配置API密钥（首次使用）
+    3. 根据文件特点调整解析参数
+    4. 点击"分析"按钮生成比对结果
+    5. 查看结果并下载报告
     """)
