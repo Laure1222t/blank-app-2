@@ -39,6 +39,7 @@ st.markdown("""
         border-radius: 4px;
         margin: 0.25rem;
         cursor: pointer;
+        display: inline-block;
     }
     .file-tab.active {
         background-color: #007bff;
@@ -47,6 +48,12 @@ st.markdown("""
     .file-tab.inactive {
         background-color: #e9ecef;
         color: #495057;
+    }
+    .clause-item {
+        padding: 0.5rem;
+        margin: 0.25rem 0;
+        border-radius: 3px;
+        background-color: #f0f2f6;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -60,11 +67,31 @@ if 'current_file' not in st.session_state:
     st.session_state.current_file = None
 if 'api_key' not in st.session_state:
     st.session_state.api_key = os.getenv("QWEN_API_KEY", "")
+if 'max_clauses' not in st.session_state:
+    st.session_state.max_clauses = 30  # 默认最大条款数
 
 # 页面标题
 st.title("📜 多文件政策比对分析工具")
 st.markdown("上传目标政策文件和多个待比对文件，系统将逐一进行条款比对与合规性分析")
 st.markdown("---")
+
+# 条款数量设置
+st.sidebar.subheader("条款提取设置")
+st.session_state.max_clauses = st.sidebar.slider(
+    "最大条款数量", 
+    min_value=0, 
+    max_value=50, 
+    value=st.session_state.max_clauses,
+    help="设置从文件中提取的最大条款数量，0表示无限制（最多50条）"
+)
+
+# 条款拆分精细度设置
+clause_precision = st.sidebar.select_slider(
+    "条款拆分精细度",
+    options=["粗略", "中等", "精细"],
+    value="中等",
+    help="设置条款拆分的精细程度，精细模式会识别更多子条款"
+)
 
 # API配置
 with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
@@ -76,9 +103,9 @@ with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
     )
     st.caption("提示：可从阿里云DashScope平台获取API密钥，不同模型能力和成本不同")
 
-# PDF解析函数
-def parse_pdf(file):
-    """解析PDF文件并提取条款"""
+# 优化的PDF解析函数 - 更细致的条款拆分
+def parse_pdf(file, max_clauses=30, precision="中等"):
+    """解析PDF文件并提取结构化条款，支持不同精细度"""
     try:
         with st.spinner("正在解析文件..."):
             doc = fitz.open(stream=file.read(), filetype="pdf")
@@ -88,26 +115,57 @@ def parse_pdf(file):
             
             # 清理文本
             text = re.sub(r'\s+', ' ', text).strip()
+            text = re.sub(r'(\r\n|\r|\n)', ' ', text)
+            text = re.sub(r'(\s\s+)', ' ', text)
             
-            # 条款提取
-            clause_patterns = [
-                re.compile(r'(\d+\.\s+.*?)(?=\d+\.\s+|$)', re.DOTALL),
-                re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|\d+\.\s+|$)', re.DOTALL),
-                re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|\d+\.\d+\s+|$)', re.DOTALL)
-            ]
+            # 根据精细度选择不同的条款提取模式
+            patterns = []
+            
+            if precision == "精细":
+                # 精细模式：识别多级条款，包括带括号的编号
+                patterns = [
+                    re.compile(r'(\d+\.\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\.\d+\s+|$)', re.DOTALL),  # 四级条款
+                    re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|$)', re.DOTALL),          # 三级条款
+                    re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级条款
+                    re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级数字条款
+                    re.compile(r'([一二三四五六七八九十]+\.\s+.*?)(?=[一二三四五六七八九十]+\.\s+|$)', re.DOTALL),  # 中文数字条款
+                    re.compile(r'(\([一二三四五六七八九十]\)\s+.*?)(?=\([一二三四五六七八九十]\)\s+|$)', re.DOTALL),  # 带括号中文条款
+                    re.compile(r'([A-Za-z]\.\s+.*?)(?=[A-Za-z]\.\s+|$)', re.DOTALL)               # 字母编号条款
+                ]
+            elif precision == "中等":
+                # 中等模式：识别主要层级条款
+                patterns = [
+                    re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|$)', re.DOTALL),          # 三级条款
+                    re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级条款
+                    re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级数字条款
+                    re.compile(r'([一二三四五六七八九十]+\.\s+.*?)(?=[一二三四五六七八九十]+\.\s+|$)', re.DOTALL)   # 中文数字条款
+                ]
+            else:  # 粗略
+                # 粗略模式：只识别主要条款
+                patterns = [
+                    re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),                  # 二级条款
+                    re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL),                            # 一级数字条款
+                    re.compile(r'([一二三四五六七八九十]+\.\s+.*?)(?=[一二三四五六七八九十]+\.\s+|$)', re.DOTALL)   # 中文数字条款
+                ]
             
             clauses = []
-            for pattern in clause_patterns:
+            for pattern in patterns:
                 matches = pattern.findall(text)
                 if matches:
+                    # 过滤过短的条款
                     clauses = [match.strip() for match in matches if len(match.strip()) > 20]
                     break
             
+            # 如果没有识别到条款格式，按段落分割
             if not clauses:
-                paragraphs = [p.strip() for p in text.split('\n') if len(p.strip()) > 50]
+                # 使用句号和换行分割段落
+                paragraphs = re.split(r'。(?=\s|$)|(?<=\s)。', text)
+                paragraphs = [p.strip() + '。' for p in paragraphs if len(p.strip()) > 50]
                 clauses = paragraphs
             
-            return clauses[:30]
+            # 应用最大条款数限制
+            max_clauses = min(max_clauses, 50) if max_clauses > 0 else 50
+            return clauses[:max_clauses]
             
     except Exception as e:
         st.error(f"文件解析错误: {str(e)}")
@@ -162,8 +220,8 @@ def analyze_compliance(target_clauses, compare_clauses, api_key, model):
         return None
     
     # 准备条款文本
-    target_text = "\n".join([f"条款{i+1}: {clause[:200]}" for i, clause in enumerate(target_clauses[:15])])
-    compare_text = "\n".join([f"条款{i+1}: {clause[:200]}" for i, clause in enumerate(compare_clauses[:15])])
+    target_text = "\n".join([f"条款{i+1}: {clause[:200]}" for i, clause in enumerate(target_clauses)])
+    compare_text = "\n".join([f"条款{i+1}: {clause[:200]}" for i, clause in enumerate(compare_clauses)])
     
     # 分析提示词
     prompt = """
@@ -238,12 +296,17 @@ with col1:
     target_file = st.file_uploader("上传目标政策文件 (PDF)", type="pdf", key="target")
     
     if target_file:
-        st.session_state.target_clauses = parse_pdf(target_file)
+        # 使用当前设置解析目标文件
+        st.session_state.target_clauses = parse_pdf(
+            target_file, 
+            max_clauses=st.session_state.max_clauses,
+            precision=clause_precision
+        )
         st.success(f"✅ 解析完成，提取到 {len(st.session_state.target_clauses)} 条条款")
         
-        with st.expander(f"查看提取的条款 (显示前10条)"):
-            for i, clause in enumerate(st.session_state.target_clauses[:10]):
-                st.markdown(f"**条款 {i+1}:** {clause[:150]}..." if len(clause) > 150 else f"**条款 {i+1}:** {clause}")
+        with st.expander(f"查看提取的条款 (共 {len(st.session_state.target_clauses)} 条)"):
+            for i, clause in enumerate(st.session_state.target_clauses):
+                st.markdown(f'<div class="clause-item"><strong>条款 {i+1}:</strong> {clause[:150]}...' if len(clause) > 150 else f'<div class="clause-item"><strong>条款 {i+1}:</strong> {clause}</div>', unsafe_allow_html=True)
     
     # 多文件上传区域
     st.subheader("待比对文件")
@@ -259,7 +322,12 @@ with col1:
     if compare_files:
         for file in compare_files:
             if file.name not in st.session_state.compare_files:
-                clauses = parse_pdf(file)
+                # 使用当前设置解析待比对文件
+                clauses = parse_pdf(
+                    file, 
+                    max_clauses=st.session_state.max_clauses,
+                    precision=clause_precision
+                )
                 st.session_state.compare_files[file.name] = {
                     "clauses": clauses,
                     "analysis": None
@@ -272,7 +340,7 @@ with col1:
         for filename in st.session_state.compare_files.keys():
             col_a, col_b = st.columns([3, 1])
             with col_a:
-                st.markdown(f"- {filename}")
+                st.markdown(f"- {filename} (条款数: {len(st.session_state.compare_files[filename]['clauses'])})")
             with col_b:
                 if st.button("分析", key=f"analyze_{filename}") and st.session_state.target_clauses:
                     result = analyze_compliance(
@@ -292,12 +360,21 @@ with col2:
     # 显示文件选择标签
     if st.session_state.compare_files:
         st.markdown("**选择文件查看结果：**")
-        cols = st.columns(min(3, len(st.session_state.compare_files)))
-        for i, (filename, data) in enumerate(st.session_state.compare_files.items()):
-            with cols[i % min(3, len(st.session_state.compare_files))]:
-                status = "✓" if data["analysis"] else ""
-                if st.button(f"{filename.split('.')[0]}{status}", key=f"tab_{filename}"):
-                    st.session_state.current_file = filename
+        # 计算每行显示的文件标签数量
+        cols_per_row = 3
+        files = list(st.session_state.compare_files.items())
+        rows = (len(files) + cols_per_row - 1) // cols_per_row
+        
+        for row in range(rows):
+            cols = st.columns(cols_per_row)
+            for col_idx in range(cols_per_row):
+                file_idx = row * cols_per_row + col_idx
+                if file_idx < len(files):
+                    filename, data = files[file_idx]
+                    with cols[col_idx]:
+                        status = " ✓" if data["analysis"] else ""
+                        if st.button(f"{filename.split('.')[0]}{status}", key=f"tab_{filename}"):
+                            st.session_state.current_file = filename
     
     # 显示当前选中文件的分析结果
     if st.session_state.current_file and st.session_state.compare_files[st.session_state.current_file]["analysis"]:
@@ -337,12 +414,15 @@ with st.expander("ℹ️ 使用帮助"):
     st.markdown("""
     1. 首先上传目标政策文件（左侧）
     2. 配置Qwen API密钥（首次使用需要）
-    3. 上传一个或多个待比对文件（左侧）
-    4. 对每个待比对文件点击"分析"按钮
-    5. 在右侧查看不同文件的分析结果并下载报告
+    3. 在侧边栏设置条款提取参数：
+       - 最大条款数量：控制从文件中提取的条款总数
+       - 条款拆分精细度：调整条款识别的详细程度
+    4. 上传一个或多个待比对文件（左侧）
+    5. 对每个待比对文件点击"分析"按钮
+    6. 在右侧查看不同文件的分析结果并下载报告
     
     注意：
     - API调用可能产生费用，请参考阿里云DashScope平台定价
     - 分析结果取决于文件质量和条款清晰度
-    - 可同时上传多个文件，逐一进行分析和查看
+    - 精细模式可能提取更多子条款，但也可能产生重复或错误
     """)
