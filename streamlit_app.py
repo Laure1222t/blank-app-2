@@ -358,6 +358,7 @@ with col1:
                     file, 
                     max_clauses=st.session_state.max_clauses
                 )
+                # 确保新文件的字典结构完整
                 st.session_state.compare_files[file.name] = {
                     "clauses": clauses,
                     "matched_results": None,
@@ -405,70 +406,80 @@ with col2:
                 if file_idx < len(files):
                     filename, data = files[file_idx]
                     with cols[col_idx]:
-                        match_count = len(data["matched_results"]) if data["matched_results"] else 0
-                        status = f" ({match_count}条匹配)" if data["matched_results"] else ""
+                        # 安全检查：确保matched_results存在且不为None
+                        if "matched_results" in data and data["matched_results"]:
+                            match_count = len(data["matched_results"])
+                            status = f" ({match_count}条匹配)"
+                        else:
+                            status = ""
+                        
                         if st.button(f"{filename.split('.')[0]}{status}", key=f"tab_{filename}"):
                             st.session_state.current_file = filename
     
     # 显示当前选中文件的分析结果
     if st.session_state.current_file:
         filename = st.session_state.current_file
-        file_data = st.session_state.compare_files.get(filename, {})
-        matched_results = file_data.get("matched_results", None)
-        summary = file_data.get("summary", "")
-        
-        if matched_results is not None:
-            # 显示总体总结
-            st.markdown("### 📊 总体分析总结")
-            st.markdown('<div class="summary-box">', unsafe_allow_html=True)
-            for para in re.split(r'\n+', summary):
-                if para.strip():
-                    st.markdown(f"{para.strip()}  \n")
-            st.markdown('</div>', unsafe_allow_html=True)
+        # 确保文件数据存在
+        if filename in st.session_state.compare_files:
+            file_data = st.session_state.compare_files[filename]
+            # 安全获取匹配结果和总结
+            matched_results = file_data.get("matched_results", None)
+            summary = file_data.get("summary", "")
             
-            # 显示匹配条款的详细分析
-            if matched_results:
-                st.markdown(f"### 🔍 匹配条款详情 ({len(matched_results)} 条)")
+            if matched_results is not None:
+                # 显示总体总结
+                st.markdown("### 📊 总体分析总结")
+                st.markdown('<div class="summary-box">', unsafe_allow_html=True)
+                for para in re.split(r'\n+', summary):
+                    if para.strip():
+                        st.markdown(f"{para.strip()}  \n")
+                st.markdown('</div>', unsafe_allow_html=True)
                 
-                for clause_num, details in matched_results.items():
-                    st.markdown(f'#### 第{clause_num}条')
-                    st.markdown('<div class="matched-clause">', unsafe_allow_html=True)
+                # 显示匹配条款的详细分析
+                if matched_results:
+                    st.markdown(f"### 🔍 匹配条款详情 ({len(matched_results)} 条)")
                     
-                    st.markdown("**目标条款内容：**")
-                    st.write(details["target"][:500] + "..." if len(details["target"]) > 500 else details["target"])
-                    
-                    st.markdown("**待比对条款内容：**")
-                    st.write(details["compare"][:500] + "..." if len(details["compare"]) > 500 else details["compare"])
-                    
-                    st.markdown('<div class="difference-section">', unsafe_allow_html=True)
-                    st.markdown("**分析结果：**")
-                    for para in re.split(r'\n+', details["analysis"]):
-                        if para.strip():
-                            st.markdown(f"{para.strip()}  \n")
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    st.markdown('</div>', unsafe_allow_html=True)
-            
-            # 生成并下载Word文档
-            if target_file and matched_results is not None:
-                word_file = generate_word_document(
-                    matched_results,
-                    summary,
-                    target_file.name,
-                    filename
-                )
+                    for clause_num, details in matched_results.items():
+                        st.markdown(f'#### 第{clause_num}条')
+                        st.markdown('<div class="matched-clause">', unsafe_allow_html=True)
+                        
+                        st.markdown("**目标条款内容：**")
+                        st.write(details["target"][:500] + "..." if len(details["target"]) > 500 else details["target"])
+                        
+                        st.markdown("**待比对条款内容：**")
+                        st.write(details["compare"][:500] + "..." if len(details["compare"]) > 500 else details["compare"])
+                        
+                        st.markdown('<div class="difference-section">', unsafe_allow_html=True)
+                        st.markdown("**分析结果：**")
+                        for para in re.split(r'\n+', details["analysis"]):
+                            if para.strip():
+                                st.markdown(f"{para.strip()}  \n")
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
                 
-                if word_file:
-                    with open(word_file, "rb") as f:
-                        st.download_button(
-                            label=f"💾 下载 {filename} 的分析报告",
-                            data=f,
-                            file_name=f"政策条款比对报告_{filename}_{time.strftime('%Y%m%d')}.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        )
-                    os.unlink(word_file)
+                # 生成并下载Word文档
+                if target_file and matched_results is not None:
+                    word_file = generate_word_document(
+                        matched_results,
+                        summary,
+                        target_file.name,
+                        filename
+                    )
+                    
+                    if word_file:
+                        with open(word_file, "rb") as f:
+                            st.download_button(
+                                label=f"💾 下载 {filename} 的分析报告",
+                                data=f,
+                                file_name=f"政策条款比对报告_{filename}_{time.strftime('%Y%m%d')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            )
+                        os.unlink(word_file)
+            else:
+                st.info("请点击文件旁的'分析'按钮生成分析结果")
         else:
-            st.info("请点击文件旁的'分析'按钮生成分析结果")
+            st.warning("所选文件不存在，请重新选择")
     else:
         st.info("请上传待比对文件并选择一个文件查看分析结果")
 
@@ -493,3 +504,4 @@ with st.expander("ℹ️ 使用帮助"):
     - 条款内容越清晰、结构越规范，分析结果越准确
     - 分析结果仅包含匹配的条款，未匹配的条款不会显示
     """)
+    
