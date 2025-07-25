@@ -43,6 +43,7 @@ def check_tesseract_installation():
 def has_selectable_text(page):
     """判断PDF页面是否为可选择文本（非图片）"""
     text = page.get_text("text").strip()
+    # 文本长度大于50字符认为是可选择文本
     return len(text) > 50
 
 def ocr_image(image):
@@ -57,7 +58,7 @@ def ocr_image(image):
         text = pytesseract.image_to_string(
             binary_image,
             lang='chi_sim+eng',
-            config='--psm 6'
+            config='--psm 6'  # 假设单一均匀文本块
         )
         return text.strip()
     except Exception as e:
@@ -72,17 +73,19 @@ def extract_text_from_pdf(pdf_path):
         tesseract_available = check_tesseract_installation()
         
         for page_num, page in enumerate(doc):
+            # 优先尝试文本提取
             if has_selectable_text(page):
                 page_text = page.get_text("text").strip()
-                text.append(f"{page_text}")
+                text.append(f"[页面{page_num+1} 文本提取]\n{page_text}")
             else:
+                # 文本提取失败且Tesseract可用时使用OCR
                 if tesseract_available:
                     pix = page.get_pixmap()
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_result = ocr_image(img)
-                    text.append(f"{ocr_result}")
+                    text.append(f"[页面{page_num+1} OCR识别]\n{ocr_result}")
                 else:
-                    text.append(f"[警告：无法提取文本（未安装Tesseract）]")
+                    text.append(f"[页面{page_num+1} 警告：无法提取文本（未安装Tesseract）]")
         
         doc.close()
         return "\n\n".join(text)
@@ -117,13 +120,14 @@ def extract_text_from_file(uploaded_file, file_type):
         else:
             return ""
     finally:
+        # 清理临时文件
         if 'temp_path' in locals() and os.path.exists(temp_path):
             os.unlink(temp_path)
 
 
 ### 2. 中文条款拆分函数（修复正则错误版）
-def split_chinese_terms(text):
-    """拆分中文条款（修复正则表达式错误，增强稳定性）"""
+def split_chinese_terms(text, max_terms=50):
+    """拆分中文条款（修复正则表达式错误，支持最大条款数限制）"""
     # 输入验证
     if not text or not isinstance(text, str):
         st.warning("输入文本为空或无效，无法拆分条款")
@@ -163,7 +167,8 @@ def split_chinese_terms(text):
             # 如果没有找到标准编号，尝试按空行拆分
             st.info("未检测到标准条款编号，尝试按空行拆分")
             terms = [t.strip() for t in re.split(r'\n\s*\n', processed_text) if t.strip()]
-            return terms
+            # 应用最大条款数限制
+            return terms[:max_terms] if max_terms > 0 else []
         
         # 提取条款内容
         terms = []
@@ -189,23 +194,31 @@ def split_chinese_terms(text):
             term_content = processed_text[start_idx:end_idx].strip()
             if term_content:
                 terms.append(term_content)
+            
+            # 达到最大条款数则停止
+            if max_terms > 0 and len(terms) >= max_terms:
+                break
         
         # 过滤过短的条款（可能是误拆分）
         min_term_length = 10  # 最小条款长度
         terms = [term for term in terms if len(term) >= min_term_length]
         
-        st.success(f"成功拆分条款：{len(terms)}条")
-        return terms
+        # 应用最大条款数限制
+        limited_terms = terms[:max_terms] if max_terms > 0 else []
+        
+        # 拆分效果反馈
+        st.success(f"成功拆分条款：{len(limited_terms)}条（限制最大{max_terms}条）")
+        return limited_terms
         
     except re.error as e:
         st.error(f"正则表达式错误: {str(e)}")
         # 出错时的备选方案：按空行拆分
         st.info("使用备选方案拆分条款")
         terms = [t.strip() for t in re.split(r'\n\s*\n', processed_text) if t.strip()]
-        return terms
+        return terms[:max_terms] if max_terms > 0 else []
     except Exception as e:
         st.error(f"条款拆分失败: {str(e)}")
-        return [processed_text]  # 返回原始文本作为最后的备选
+        return [processed_text[:500]] if max_terms > 0 else []  # 返回部分文本作为备选
 
 
 ### 3. Qwen大模型调用（兼容模式API）
@@ -223,7 +236,7 @@ def call_qwen_api(prompt, api_key):
     payload = {
         "model": "qwen-plus",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3
+        "temperature": 0.3  # 低温度，保证结果稳定
     }
     
     try:
@@ -240,14 +253,14 @@ def call_qwen_api(prompt, api_key):
 
 def analyze_terms_with_qwen(bench_term, compare_term, api_key):
     """用Qwen分析条款匹配度"""
-    prompt = f"""请对比以下两个条款的匹配程度：
+    prompt = f"""请对比以下两个条款的匹配度：
     【基准条款】：{bench_term[:500]}
     【待比条款】：{compare_term[:500]}
     
     请按以下格式回答：
     1. 匹配度（0-100分）：[分数]
     2. 相同点：[简要说明相同内容]
-    3. 匹配依据：[说明为何认为这两个条款相匹配]
+    3. 匹配依据：[说明为什么认为这两个条款匹配]
     """
     
     result, error = call_qwen_api(prompt, api_key)
@@ -270,8 +283,8 @@ def analyze_terms_with_qwen(bench_term, compare_term, api_key):
         }, None
 
 
-### 4. 结果报告生成（只包含匹配条款）
-def generate_word_report(bench_terms, comparison_results, bench_filename):
+### 4. 结果报告生成
+def generate_word_report(bench_terms, comparison_results, bench_filename, max_terms):
     """生成只包含匹配条款的Word报告"""
     doc = docx.Document()
     
@@ -289,16 +302,17 @@ def generate_word_report(bench_terms, comparison_results, bench_filename):
     doc.add_paragraph(f"报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
     doc.add_paragraph(f"基准文件：{bench_filename}")
     doc.add_paragraph(f"对比文件数量：{len(comparison_results)}")
+    doc.add_paragraph(f"最大解析条款数：{max_terms}")
     doc.add_page_break()
     
-    # 按文件生成结果（只包含匹配条款）
-    for file_name, result in comparison_results.items():
+    # 按文件生成结果
+    for file_name, matched_terms in comparison_results.items():
         doc.add_heading(f"对比文件：{file_name}", level=1)
         
-        # 只展示匹配条款
-        doc.add_heading(f"匹配条款（共{len(result['matched_terms'])}条）", level=2)
-        if result["matched_terms"]:
-            for idx, item in enumerate(result["matched_terms"], 1):
+        # 可匹配条款
+        doc.add_heading(f"匹配条款（共{len(matched_terms)}条）", level=2)
+        if matched_terms:
+            for idx, item in enumerate(matched_terms, 1):
                 doc.add_heading(f"{idx}. 基准条款：{item['bench_term'][:30]}...", level=3)
                 doc.add_paragraph(f"对比条款：{item['compare_term'][:50]}...")
                 doc.add_paragraph(f"匹配度：{item['analysis']['score']}分")
@@ -319,15 +333,38 @@ def generate_word_report(bench_terms, comparison_results, bench_filename):
 ### 5. 主函数
 def main():
     st.title("📄 条款匹配分析工具")
-    st.write("只展示基准文件与对比文件中可匹配的条款，支持PDF/DOCX格式")
+    st.write("支持上传基准文件和多个对比文件，只展示匹配的条款并生成报告")
     
     # 侧边栏配置
     with st.sidebar:
         st.subheader("配置")
         qwen_api_key = st.text_input("阿里云DashScope API密钥", type="password")
         st.info("获取密钥：https://dashscope.console.aliyun.com/")
-        match_threshold = st.slider("匹配度阈值（分）", 0, 100, 70)
-        st.write("高于此分数的条款将被视为匹配")
+        
+        # 添加最大解析条例数设置
+        max_terms = st.slider(
+            "最大解析条款数",
+            min_value=0,
+            max_value=50,
+            value=20,
+            help="设置0-50之间的数值，限制解析的最大条款数量"
+        )
+        
+        # 匹配度阈值设置
+        match_threshold = st.slider(
+            "匹配度阈值（分）",
+            min_value=0,
+            max_value=100,
+            value=70,
+            help="高于此分数的条款将被视为匹配"
+        )
+        
+        st.divider()
+        st.subheader("使用说明")
+        st.write("1. 上传1个基准文件和多个对比文件")
+        st.write("2. 配置最大条款数和匹配度阈值")
+        st.write("3. 点击开始分析")
+        st.write("4. 查看匹配条款并下载报告")
     
     # 文件上传
     col1, col2 = st.columns(2)
@@ -337,18 +374,19 @@ def main():
         compare_files = st.file_uploader("上传对比文件（PDF/DOCX）", type=["pdf", "docx"], accept_multiple_files=True)
     
     # 分析按钮
-    if st.button("开始分析", disabled=not (bench_file and compare_files)):
+    if st.button("开始分析", disabled=not (bench_file and compare_files and max_terms > 0)):
         with st.spinner("正在处理基准文件..."):
-            # 1. 提取基准文件文本并拆分条款
+            # 1. 提取基准文件文本并拆分条款（应用最大数量限制）
             bench_type = bench_file.name.split('.')[-1].lower()
             bench_text = extract_text_from_file(bench_file, bench_type)
             
-            # 显示部分提取的文本供参考
-            with st.expander("查看提取的基准文件文本（前500字符）"):
+            # 显示提取的文本预览
+            with st.expander("查看基准文件提取文本（前500字符）"):
                 st.text(bench_text[:500])
             
-            bench_terms = split_chinese_terms(bench_text)
+            bench_terms = split_chinese_terms(bench_text, max_terms)
             st.session_state.bench_terms = bench_terms
+            st.success(f"基准文件处理完成，提取条款：{len(bench_terms)}条")
         
         # 2. 处理每个对比文件
         all_results = {}
@@ -358,27 +396,30 @@ def main():
             file_name = compare_file.name
             st.subheader(f"处理对比文件：{file_name}")
             
-            # 提取文本并拆分条款
+            # 提取文本并拆分条款（应用最大数量限制）
             compare_type = file_name.split('.')[-1].lower()
             compare_text = extract_text_from_file(compare_file, compare_type)
             
-            with st.expander(f"查看提取的{file_name}文本（前500字符）"):
+            # 显示提取的文本预览
+            with st.expander(f"查看{file_name}提取文本（前500字符）"):
                 st.text(compare_text[:500])
             
-            compare_terms = split_chinese_terms(compare_text)
+            compare_terms = split_chinese_terms(compare_text, max_terms)
             st.session_state.comparison_terms[file_name] = compare_terms
+            st.info(f"提取条款：{len(compare_terms)}条")
             
-            # 条款对比分析（只保留匹配的条款）
+            # 条款匹配分析
             matched_terms = []
             
             with st.spinner(f"正在分析 {file_name} 的条款匹配度..."):
-                # 为每个基准条款寻找最匹配的对比条款
-                for bench_term in bench_terms[:30]:  # 限制处理数量，避免超时
+                # 为每个基准条款寻找最佳匹配
+                for bench_term in bench_terms:
                     best_match = None
                     highest_score = 0
                     
-                    for compare_term in compare_terms[:30]:
-                        # 调用Qwen分析
+                    # 与所有对比条款比较
+                    for compare_term in compare_terms:
+                        # 调用Qwen分析（无API密钥则跳过）
                         if qwen_api_key:
                             analysis, error = analyze_terms_with_qwen(bench_term, compare_term, qwen_api_key)
                             if error:
@@ -386,14 +427,14 @@ def main():
                                 continue
                         else:
                             # 无API时的基础判断
-                            common_words = len(set(bench_term[:100]) & set(compare_term[:100]))
-                            score = min(100, common_words * 5)  # 简单的关键词匹配计分
+                            common_words = len(set(bench_term[:100].split()) & set(compare_term[:100].split()))
+                            score = min(100, common_words * 5)  # 简单的关键词匹配评分
                             analysis = {
                                 "score": score,
                                 "full_analysis": "未使用Qwen API，基于关键词匹配"
                             }
-                        
-                        # 记录最高匹配度
+                    
+                        # 跟踪最高分匹配
                         if analysis["score"] > highest_score:
                             highest_score = analysis["score"]
                             best_match = {
@@ -402,44 +443,47 @@ def main():
                                 "analysis": analysis
                             }
                     
-                    # 只保留达到阈值的匹配条款
+                    # 如果找到高于阈值的匹配项，则添加
                     if best_match and highest_score >= match_threshold:
                         matched_terms.append(best_match)
             
-            # 保存结果（只包含匹配条款）
-            all_results[file_name] = {
-                "matched_terms": matched_terms
-            }
-            
-            # 显示当前文件的匹配结果
+            # 保存结果
+            all_results[file_name] = matched_terms
             st.success(f"{file_name} 分析完成，找到 {len(matched_terms)} 条匹配条款")
-            if matched_terms:
-                with st.expander(f"查看 {file_name} 的匹配条款"):
-                    for i, match in enumerate(matched_terms, 1):
-                        st.write(f"**匹配项 {i}（匹配度：{match['analysis']['score']}分）**")
-                        st.text(f"基准条款：{match['bench_term'][:100]}...")
-                        st.text(f"对比条款：{match['compare_term'][:100]}...")
-                        with st.expander("查看详细分析"):
-                            st.text(match['analysis']['full_analysis'])
-                        st.divider()
             
             # 更新进度
             progress_bar.progress((file_idx + 1) / len(compare_files))
         
-        # 保存所有结果
+        # 3. 展示结果
         st.session_state.analysis_results = all_results
         st.success("所有文件分析完成！")
         
-        # 生成报告
-        if st.button("生成匹配条款报告"):
+        # 显示匹配结果
+        for file_name, matched_terms in all_results.items():
+            st.subheader(f"{file_name} 的匹配条款（{len(matched_terms)}条）")
+            for idx, item in enumerate(matched_terms, 1):
+                with st.expander(f"匹配项 {idx}（匹配度：{item['analysis']['score']}分）"):
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.write("**基准条款：**")
+                        st.write(item['bench_term'])
+                    with col_b:
+                        st.write("**对比条款：**")
+                        st.write(item['compare_term'])
+                    st.write("**匹配分析：**")
+                    st.write(item['analysis']['full_analysis'])
+        
+        # 4. 生成报告
+        if st.button("生成Word报告"):
             with st.spinner("正在生成报告..."):
                 report_buffer = generate_word_report(
                     bench_terms, 
                     all_results, 
-                    bench_file.name
+                    bench_file.name,
+                    max_terms
                 )
                 st.download_button(
-                    label="下载Word报告",
+                    label="下载报告",
                     data=report_buffer,
                     file_name=f"条款匹配分析报告_{datetime.now().strftime('%Y%m%d')}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
