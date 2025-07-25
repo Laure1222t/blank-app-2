@@ -2,8 +2,8 @@ streamlit==1.35.0
 python-docx==0.8.11
 regex==2023.12.25
 dashscope==1.14.0
-PyMuPDF==1.23.18  # 用于PDF处理
-pytesseract==0.3.10  # OCR识别库
-Pillow==10.2.0  # 图像处理库
-numpy==1.26.4  # 用于图像处理辅助
+PyMuPDF==1.23.18
+pytesseract==0.3.10
+Pillow==10.2.0
+numpy==1.26.4
     
