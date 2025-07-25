@@ -1,214 +1,238 @@
 import streamlit as st
-from PyPDF2 import PdfReader
-from difflib import SequenceMatcher
-import base64
+import docx
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 import re
-import requests
-import jieba
-import time
-from io import StringIO
-from typing import List, Tuple, Optional
+import os
+import tempfile
+from datetime import datetime
 
-# 页面设置
+# 设置页面配置
 st.set_page_config(
-    page_title="合规性分析工具",
-    page_icon="📊",
+    page_title="条款合规性对比工具",
+    page_icon="📄",
     layout="wide"
 )
 
-# 自定义样式
-st.markdown("""
-<style>
-    .stApp { max-width: 1200px; margin: 0 auto; }
-    .status-box { padding: 10px; border-radius: 5px; margin: 10px 0; }
-    .disabled-hint { color: #666; font-style: italic; }
-</style>
-""", unsafe_allow_html=True)
+# 页面标题
+st.title("📄 条款合规性对比工具")
+st.write("上传基准文件和待比较文件，系统将自动进行条款匹配分析并生成合规性报告。")
 
-# API配置
-QWEN_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+# 辅助函数：从docx文件中提取文本
+def extract_text_from_docx(file_path):
+    doc = docx.Document(file_path)
+    full_text = []
+    for para in doc.paragraphs:
+        if para.text.strip():  # 只添加非空段落
+            full_text.append(para.text)
+    return '\n'.join(full_text)
 
-# 会话状态初始化
-if 'analysis_running' not in st.session_state:
-    st.session_state.analysis_running = False
-if 'button_disabled' not in st.session_state:
-    st.session_state.button_disabled = True
-if 'disabled_reason' not in st.session_state:
-    st.session_state.disabled_reason = "请完成所有必要设置"
+# 辅助函数：拆分条款（假设条款以数字开头，如"1. "、"2.1 "等）
+def split_terms(text):
+    # 使用正则表达式匹配条款编号，如1. 1.1 2. 等
+    pattern = r'(\d+\.\s|\d+\.\d+\s|\d+\s)'
+    terms = re.split(pattern, text)
+    
+    # 重组条款，将编号和内容合并
+    result = []
+    for i in range(1, len(terms), 2):
+        if i + 1 < len(terms):
+            term_number = terms[i].strip()
+            term_content = terms[i+1].strip()
+            result.append(f"{term_number} {term_content}")
+    
+    # 如果没有匹配到条款编号格式，将整个文本作为一个条款
+    if not result:
+        result.append(text)
+    
+    return result
 
-def update_button_state(base_file, target_files, api_key):
-    """更新按钮状态和禁用原因"""
-    if st.session_state.analysis_running:
-        st.session_state.button_disabled = True
-        st.session_state.disabled_reason = "分析正在进行中"
-    elif not base_file:
-        st.session_state.button_disabled = True
-        st.session_state.disabled_reason = "请上传基准文件"
-    elif not target_files:
-        st.session_state.button_disabled = True
-        st.session_state.disabled_reason = "请上传至少一个目标文件"
-    elif not api_key or api_key.strip() == "":
-        st.session_state.button_disabled = True
-        st.session_state.disabled_reason = "请输入API密钥"
+# 辅助函数：简单的条款匹配（基于关键词相似度）
+def match_terms(benchmark_term, compare_terms, threshold=0.3):
+    benchmark_words = set(re.findall(r'\w+', benchmark_term.lower()))
+    best_match = None
+    best_score = 0
+    
+    for term in compare_terms:
+        compare_words = set(re.findall(r'\w+', term.lower()))
+        # 计算词集交集比例
+        common_words = benchmark_words.intersection(compare_words)
+        score = len(common_words) / len(benchmark_words) if benchmark_words else 0
+        
+        if score > best_score and score >= threshold:
+            best_score = score
+            best_match = term
+    
+    return best_match, best_score
+
+# 辅助函数：生成Word报告
+def generate_word_report(benchmark_name, compare_name, matched_terms, unmatched_benchmark, unmatched_compare):
+    doc = docx.Document()
+    
+    # 添加标题
+    title = doc.add_heading('条款合规性对比报告', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # 添加报告信息
+    doc.add_paragraph(f"基准文件: {benchmark_name}")
+    doc.add_paragraph(f"对比文件: {compare_name}")
+    doc.add_paragraph(f"报告生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    doc.add_paragraph("")  # 空行
+    
+    # 添加匹配的条款部分
+    doc.add_heading('一、匹配的条款', level=1)
+    if matched_terms:
+        for i, (benchmark_term, compare_term, score) in enumerate(matched_terms, 1):
+            doc.add_heading(f"匹配项 {i} (相似度: {score:.2f})", level=2)
+            
+            p = doc.add_paragraph("基准条款: ")
+            p.add_run(benchmark_term).bold = True
+            
+            p = doc.add_paragraph("对比条款: ")
+            p.add_run(compare_term).bold = True
+            
+            doc.add_paragraph("")  # 空行
     else:
-        st.session_state.button_disabled = False
-        st.session_state.disabled_reason = ""
+        doc.add_paragraph("未找到匹配的条款")
+    
+    # 添加基准文件中未匹配的条款
+    doc.add_heading('二、基准文件中未匹配的条款', level=1)
+    if unmatched_benchmark:
+        for term in unmatched_benchmark:
+            p = doc.add_paragraph(term)
+            p.italic = True
+    else:
+        doc.add_paragraph("所有基准条款均找到匹配项")
+    
+    # 添加对比文件中未匹配的条款（不合规总结）
+    doc.add_heading('三、对比文件中未匹配的条款（不合规总结）', level=1)
+    if unmatched_compare:
+        for term in unmatched_compare:
+            p = doc.add_paragraph(term)
+            p.italic = True
+    else:
+        doc.add_paragraph("对比文件所有条款均与基准文件匹配")
+    
+    # 保存到临时文件
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.docx')
+    doc.save(temp_file.name)
+    temp_file.close()
+    
+    return temp_file.name
 
-# 简化的核心函数（保持功能但精简代码）
-def call_qwen_api(prompt: str, api_key: str) -> Optional[str]:
-    try:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-        
-        data = {
-            "model": "qwen-plus",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 1000
-        }
-        
-        response = requests.post(QWEN_API_URL, headers=headers, json=data, timeout=30)
-        if response.status_code == 200:
-            response_json = response.json()
-            if "choices" in response_json and len(response_json["choices"]) > 0:
-                return response_json["choices"][0]["message"]["content"]
-        return None
-    except:
-        return None
-
-def extract_text_from_pdf(file) -> str:
-    try:
-        pdf_reader = PdfReader(file)
-        text = ""
-        for page in pdf_reader.pages[:20]:  # 限制页数
-            page_text = page.extract_text() or ""
-            text += page_text.replace("  ", "").replace("\n", "")
-        return text[:50000]  # 限制文本长度
-    except:
-        return ""
-
-def split_into_clauses(text: str, max_clauses: int = 20) -> List[str]:
-    patterns = [
-        r'(第[一二三四五六七八九十百]+条\s+.*?)(?=第[一二三四五六七八九十百]+条\s+|$)',
-        r'(\d+\.\s+.*?)(?=\d+\.\s+|$)',
-    ]
-    for pattern in patterns:
-        clauses = re.findall(pattern, text, re.DOTALL)
-        if len(clauses) > 3:
-            return [clause.strip() for clause in clauses if clause.strip()][:max_clauses]
-    paragraphs = re.split(r'[。；！？]\s*', text)
-    return [p.strip() for p in paragraphs if p.strip() and len(p) > 10][:max_clauses]
-
-def match_clauses_with_base(base_clauses, target_clauses) -> List[Tuple[str, str, float]]:
-    matched_pairs = []
-    used_indices = set()
-    for base_clause in base_clauses[:15]:
-        best_match = None
-        best_ratio = 0.35
-        best_idx = -1
-        for idx, target_clause in enumerate(target_clauses[:20]):
-            if idx not in used_indices:
-                ratio = SequenceMatcher(None, base_clause, target_clause).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_match = target_clause
-                    best_idx = idx
-        if best_match:
-            matched_pairs.append((base_clause, best_match, best_ratio))
-            used_indices.add(best_idx)
-    return matched_pairs
-
-def generate_target_report(matched_pairs, base_name, target_name, api_key) -> str:
-    report = [f"合规性分析报告: {target_name} vs {base_name}\n{'-'*50}\n"]
-    for i, (base_clause, target_clause, ratio) in enumerate(matched_pairs):
-        report.append(f"条款对 {i+1} (相似度: {ratio:.2%})")
-        report.append(f"基准条款: {base_clause[:150]}...")
-        report.append(f"目标条款: {target_clause[:150]}...\n")
-        
-        prompt = f"分析基准条款: {base_clause[:300]} 与目标条款: {target_clause[:300]} 的合规性，简要说明符合程度、差异和建议。"
-        analysis = call_qwen_api(prompt, api_key)
-        report.append(f"分析: {analysis if analysis else '无法获取分析结果'}\n{'-'*50}\n")
-    return "\n".join(report)
-
-def get_download_link(text: str, filename: str) -> str:
-    b64 = base64.b64encode(text.encode()).decode()
-    return f'<a href="data:text/plain;base64,{b64}" download="{filename}" style="padding:8px 16px;background:#007bff;color:white;text-decoration:none;border-radius:4px;margin:5px 0;display:inline-block;">下载报告</a>'
-
+# 主函数
 def main():
-    st.title("合规性分析工具")
-    st.write("基准文件与多目标文件条款对比")
-    
-    # 侧边栏设置
-    with st.sidebar:
-        st.subheader("API设置")
-        api_key = st.text_input("Qwen API密钥", type="password", key="api_key")
-        max_clauses = st.slider("最大条款数/文件", 5, 30, 10)
-    
-    # 文件上传
+    # 文件上传区域
     col1, col2 = st.columns(2)
+    
     with col1:
         st.subheader("基准文件")
-        base_file = st.file_uploader("上传基准PDF", type="pdf", key="base_file")
+        benchmark_file = st.file_uploader("上传基准条款文件 (docx)", type=["docx"], key="benchmark")
     
     with col2:
-        st.subheader("目标文件")
-        target_files = st.file_uploader(
-            "上传目标PDF（可多个）", 
-            type="pdf", 
-            key="target_files",
-            accept_multiple_files=True
-        )
-    
-    # 更新按钮状态
-    update_button_state(base_file, target_files, api_key)
-    
-    # 显示按钮禁用原因（如果有）
-    if st.session_state.button_disabled and st.session_state.disabled_reason:
-        st.markdown(f'<p class="disabled-hint">🔒 开始分析按钮已禁用: {st.session_state.disabled_reason}</p>', unsafe_allow_html=True)
+        st.subheader("待比较文件")
+        compare_file = st.file_uploader("上传待比较条款文件 (docx)", type=["docx"], key="compare")
     
     # 分析按钮
-    if st.button("开始分析", disabled=st.session_state.button_disabled):
-        st.session_state.analysis_running = True
-        
-        try:
-            # 处理基准文件
-            with st.spinner("处理基准文件..."):
-                base_text = extract_text_from_pdf(base_file)
-                if not base_text:
-                    st.error("无法从基准文件提取文本")
-                    st.session_state.analysis_running = False
-                    return
-                base_clauses = split_into_clauses(base_text, max_clauses)
-                st.success(f"基准文件处理完成，提取到 {len(base_clauses)} 条条款")
+    if st.button("开始分析") and benchmark_file and compare_file:
+        with st.spinner("正在分析文件..."):
+            # 保存上传的文件到临时目录
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as f:
+                f.write(benchmark_file.getbuffer())
+                benchmark_path = f.name
             
-            # 处理目标文件
-            for idx, target_file in enumerate(target_files, 1):
-                st.subheader(f"分析目标文件 {idx}/{len(target_files)}: {target_file.name}")
-                target_text = extract_text_from_pdf(target_file)
-                if not target_text:
-                    st.warning("无法提取文件内容，跳过")
-                    continue
-                
-                target_clauses = split_into_clauses(target_text, max_clauses)
-                matched_pairs = match_clauses_with_base(base_clauses, target_clauses)
-                
-                if not matched_pairs:
-                    st.warning("未找到匹配条款，无法分析")
-                    continue
-                
-                report = generate_target_report(matched_pairs, base_file.name, target_file.name, api_key)
-                st.markdown(get_download_link(report, f"{target_file.name}_合规性报告.txt"), unsafe_allow_html=True)
-                with st.expander("查看报告预览"):
-                    st.text_area("报告内容", report, height=200)
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as f:
+                f.write(compare_file.getbuffer())
+                compare_path = f.name
             
-            st.session_state.analysis_running = False
-            st.success("所有文件分析完成！")
-                
-        except Exception as e:
-            st.error(f"分析出错: {str(e)}")
-            st.session_state.analysis_running = False
+            # 提取文本
+            benchmark_text = extract_text_from_docx(benchmark_path)
+            compare_text = extract_text_from_docx(compare_path)
+            
+            # 拆分条款
+            benchmark_terms = split_terms(benchmark_text)
+            compare_terms = split_terms(compare_text)
+            
+            # 显示条款数量
+            st.info(f"基准文件提取到 {len(benchmark_terms)} 条条款")
+            st.info(f"对比文件提取到 {len(compare_terms)} 条条款")
+            
+            # 进行条款匹配
+            matched_terms = []
+            matched_compare_indices = set()
+            
+            for benchmark_term in benchmark_terms:
+                match, score = match_terms(benchmark_term, compare_terms)
+                if match:
+                    matched_terms.append((benchmark_term, match, score))
+                    # 记录已匹配的对比条款索引
+                    matched_compare_indices.add(compare_terms.index(match))
+            
+            # 找出未匹配的条款
+            unmatched_benchmark = []
+            matched_benchmark_terms = [term[0] for term in matched_terms]
+            for term in benchmark_terms:
+                if term not in matched_benchmark_terms:
+                    unmatched_benchmark.append(term)
+            
+            unmatched_compare = []
+            for i, term in enumerate(compare_terms):
+                if i not in matched_compare_indices:
+                    unmatched_compare.append(term)
+            
+            # 显示结果
+            st.subheader("分析结果")
+            
+            # 显示匹配的条款
+            with st.expander("查看匹配的条款", expanded=True):
+                if matched_terms:
+                    for i, (benchmark_term, compare_term, score) in enumerate(matched_terms, 1):
+                        st.markdown(f"**匹配项 {i} (相似度: {score:.2f})**")
+                        st.markdown(f"基准条款: {benchmark_term}")
+                        st.markdown(f"对比条款: {compare_term}")
+                        st.markdown("---")
+                else:
+                    st.warning("未找到匹配的条款")
+            
+            # 显示未匹配的基准条款
+            with st.expander("查看基准文件中未匹配的条款"):
+                if unmatched_benchmark:
+                    for term in unmatched_benchmark:
+                        st.markdown(f"- {term}")
+                else:
+                    st.success("所有基准条款均找到匹配项")
+            
+            # 显示未匹配的对比条款（不合规总结）
+            with st.expander("查看对比文件中未匹配的条款（不合规总结）"):
+                if unmatched_compare:
+                    for term in unmatched_compare:
+                        st.markdown(f"- {term}")
+                else:
+                    st.success("对比文件所有条款均与基准文件匹配")
+            
+            # 生成并提供下载Word报告
+            st.subheader("生成报告")
+            report_path = generate_word_report(
+                benchmark_file.name, 
+                compare_file.name, 
+                matched_terms, 
+                unmatched_benchmark, 
+                unmatched_compare
+            )
+            
+            # 提供下载
+            with open(report_path, "rb") as file:
+                st.download_button(
+                    label="下载合规性报告 (Word)",
+                    data=file,
+                    file_name=f"合规性对比报告_{benchmark_file.name.split('.')[0]}_vs_{compare_file.name.split('.')[0]}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+            
+            # 清理临时文件
+            os.unlink(benchmark_path)
+            os.unlink(compare_path)
+            os.unlink(report_path)
 
 if __name__ == "__main__":
     main()
