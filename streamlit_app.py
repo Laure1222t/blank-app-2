@@ -53,16 +53,10 @@ st.markdown("""
         margin: 1rem 0;
         background-color: #f0f7ff;
     }
-    .file-tab {
-        padding: 0.5rem 1rem;
-        border-radius: 4px;
-        margin: 0.25rem;
-        cursor: pointer;
-        display: inline-block;
-    }
-    .file-tab.active {
-        background-color: #007bff;
-        color: white;
+    .parse-info {
+        font-size: 0.9rem;
+        color: #6c757d;
+        margin-top: 0.5rem;
     }
     .clause-item {
         padding: 0.5rem;
@@ -84,10 +78,12 @@ if 'api_key' not in st.session_state:
     st.session_state.api_key = os.getenv("QWEN_API_KEY", "")
 if 'max_clauses' not in st.session_state:
     st.session_state.max_clauses = 30  # 默认最大条款数
+if 'parse_precision' not in st.session_state:
+    st.session_state.parse_precision = "中等"  # 解析精度
 
 # 页面标题
 st.title("📜 条款式政策比对分析工具")
-st.markdown("按条款精确匹配分析，仅显示匹配成功的条款并生成总结")
+st.markdown("精确解析政策文件条款，按编号匹配并分析合规性与差异")
 st.markdown("---")
 
 # 条款提取设置
@@ -100,6 +96,14 @@ st.session_state.max_clauses = st.sidebar.slider(
     help="设置从文件中提取的最大条款数量，0表示无限制（最多50条）"
 )
 
+# 解析精度设置
+st.session_state.parse_precision = st.sidebar.select_slider(
+    "条款解析精度",
+    options=["宽松", "中等", "严格"],
+    value=st.session_state.parse_precision,
+    help="宽松：提取更多可能的条款；严格：只提取明确符合格式的条款"
+)
+
 # API配置
 with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
     st.session_state.api_key = st.text_input("请输入Qwen API密钥", value=st.session_state.api_key, type="password")
@@ -110,57 +114,110 @@ with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
     )
     st.caption("提示：可从阿里云DashScope平台获取API密钥")
 
-# 优化的PDF解析函数 - 按条款号提取
-def parse_pdf_by_clauses(file, max_clauses=30):
-    """解析PDF文件并按条款号提取结构化条款"""
+# 优化的PDF解析函数 - 增强条款拆分能力
+def parse_pdf_by_clauses(file, max_clauses=30, precision="中等"):
+    """解析PDF文件并按条款号提取结构化条款，优化拆分逻辑"""
     try:
-        with st.spinner("正在解析文件..."):
+        with st.spinner("正在解析文件并拆分条款..."):
             doc = fitz.open(stream=file.read(), filetype="pdf")
             total_pages = len(doc)
-            text = ""
+            full_text = ""
             
-            # 读取所有页面文本
-            for page in doc:
-                text += page.get_text() + "\n\n"
+            # 逐页读取文本，保留页面信息
+            for page_num, page in enumerate(doc, 1):
+                page_text = page.get_text()
+                # 清理页面文本并添加页分隔符
+                full_text += f"\n\n[[PAGE {page_num}]]\n{page_text}"
             
-            # 文本预处理
-            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)  # 移除控制字符
-            text = re.sub(r'(\r\n|\r|\n)+', '\n', text)  # 统一换行符
-            text = re.sub(r'[^\S\n]+', ' ', text)  # 替换非换行的空白字符为空格
-            text = text.strip()
+            # 文本预处理 - 增强条款识别
+            full_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', full_text)  # 移除控制字符
+            full_text = re.sub(r'(\r\n|\r|\n)+', '\n', full_text)  # 统一换行符
+            full_text = re.sub(r'[^\S\n]+', ' ', full_text)  # 替换非换行空白字符为空格
+            full_text = re.sub(r'(\d+)\.(\d+)', r'\1.\2', full_text)  # 修复数字间的点
+            full_text = full_text.strip()
             
-            # 提取条款 - 重点匹配"第X条"格式
-            clause_pattern = re.compile(r'(第[零一二三四五六七八九十百\d]+\s*条\s+.*?)(?=第[零一二三四五六七八九十百\d]+\s*条\s+|$)', re.DOTALL)
-            matches = clause_pattern.findall(text)
-            
+            # 根据精度选择不同的条款提取模式
             clauses = {}
-            for match in matches:
-                # 提取条款号
-                clause_num_match = re.search(r'第([零一二三四五六七八九十百\d]+)\s*条', match)
-                if clause_num_match:
-                    clause_num = clause_num_match.group(1)
-                    # 清理条款内容
-                    clause_content = re.sub(r'第[零一二三四五六七八九十百\d]+\s*条\s*', '', match).strip()
-                    if clause_content and len(clause_content) > 20:
-                        clauses[clause_num] = clause_content
-                
-                # 达到最大条款数则停止
-                if 0 < max_clauses <= len(clauses):
-                    break
             
-            # 如果没有提取到条款，尝试其他格式
-            if not clauses:
-                st.info("未识别到'第X条'格式，尝试按其他编号提取...")
-                alt_pattern = re.compile(r'(\d+\.\s+.*?)(?=\d+\.\s+|$)', re.DOTALL)
-                alt_matches = alt_pattern.findall(text)
-                for i, match in enumerate(alt_matches):
-                    if match.strip() and len(match.strip()) > 20:
-                        clauses[str(i+1)] = match.strip()
-                        if 0 < max_clauses <= len(clauses):
+            # 主要条款模式：第X条
+            primary_pattern = re.compile(r'(第[零一二三四五六七八九十百千\d]+\s*条\s+.*?)(?=第[零一二三四五六七八九十百千\d]+\s*条\s+|$)', re.DOTALL)
+            primary_matches = primary_pattern.findall(full_text)
+            
+            if primary_matches:
+                # 从主要模式提取条款
+                for match in primary_matches:
+                    clause_num_match = re.search(r'第([零一二三四五六七八九十百千\d]+)\s*条', match)
+                    if clause_num_match:
+                        clause_num = clause_num_match.group(1)
+                        # 清理条款内容
+                        clause_content = re.sub(r'第[零一二三四五六七八九十百千\d]+\s*条\s*', '', match).strip()
+                        # 移除页码标记
+                        clause_content = re.sub(r'\[\[PAGE \d+\]\]', '', clause_content)
+                        
+                        # 根据精度过滤条款
+                        if clause_content:
+                            if precision == "严格" and len(clause_content) > 50:
+                                clauses[clause_num] = clause_content
+                            elif precision == "中等" and len(clause_content) > 30:
+                                clauses[clause_num] = clause_content
+                            elif precision == "宽松" and len(clause_content) > 20:
+                                clauses[clause_num] = clause_content
+                    
+                    # 达到最大条款数则停止
+                    if 0 < max_clauses <= len(clauses):
+                        break
+            
+            # 如果主要模式提取不足，尝试辅助模式
+            if not clauses or len(clauses) < 5:
+                st.markdown('<p class="parse-info">尝试其他条款格式提取...</p>', unsafe_allow_html=True)
+                
+                # 辅助模式1：数字编号 (1., 1.1, 1.1.1等)
+                alt_patterns = [
+                    re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|$)', re.DOTALL),  # 三级
+                    re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),          # 二级
+                    re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL)                     # 一级
+                ]
+                
+                for pattern in alt_patterns:
+                    alt_matches = pattern.findall(full_text)
+                    if alt_matches and len(alt_matches) > len(clauses):
+                        for i, match in enumerate(alt_matches):
+                            match = match.strip()
+                            if match:
+                                # 移除页码标记
+                                clean_match = re.sub(r'\[\[PAGE \d+\]\]', '', match)
+                                # 提取数字编号
+                                num_match = re.search(r'^(\d+(\.\d+)*)', clean_match)
+                                if num_match:
+                                    clause_num = num_match.group(1)
+                                    clause_content = re.sub(r'^\d+(\.\d+)*\s*', '', clean_match).strip()
+                                else:
+                                    clause_num = str(i+1)
+                                    clause_content = clean_match
+                                
+                                if clause_content:
+                                    clauses[clause_num] = clause_content
+                                
+                                # 达到最大条款数则停止
+                                if 0 < max_clauses <= len(clauses):
+                                    break
+                        if clauses:
                             break
             
-            st.success(f"共解析 {total_pages} 页，提取 {len(clauses)} 条条款")
-            return clauses
+            # 最终过滤和整理
+            final_clauses = {}
+            for num, content in clauses.items():
+                # 移除多余空白和清理内容
+                cleaned = re.sub(r'\s+', ' ', content).strip()
+                if len(cleaned) > 20:  # 确保条款有足够内容
+                    final_clauses[num] = cleaned
+            
+            # 限制最大条款数
+            if 0 < max_clauses < len(final_clauses):
+                final_clauses = dict(list(final_clauses.items())[:max_clauses])
+            
+            st.success(f"共解析 {total_pages} 页，成功提取 {len(final_clauses)} 条条款")
+            return final_clauses
             
     except Exception as e:
         st.error(f"文件解析错误: {str(e)}")
@@ -324,14 +381,15 @@ col1, col2 = st.columns([1, 2], gap="large")
 
 with col1:
     st.subheader("目标政策文件")
-    st.caption("作为基准的政策文件，按'第X条'提取条款")
+    st.caption("作为基准的政策文件，系统将自动识别并拆分条款")
     target_file = st.file_uploader("上传目标政策文件 (PDF)", type="pdf", key="target")
     
     if target_file:
         # 解析目标文件条款
         st.session_state.target_clauses = parse_pdf_by_clauses(
             target_file, 
-            max_clauses=st.session_state.max_clauses
+            max_clauses=st.session_state.max_clauses,
+            precision=st.session_state.parse_precision
         )
         
         with st.expander(f"查看提取的条款 (共 {len(st.session_state.target_clauses)} 条)"):
@@ -341,7 +399,7 @@ with col1:
     
     # 多文件上传区域
     st.subheader("待比对文件")
-    st.caption("可上传多个文件，将按条款号匹配分析")
+    st.caption("可上传多个文件，系统将自动拆分条款并按编号匹配")
     compare_files = st.file_uploader(
         "上传待比对文件 (PDF)", 
         type="pdf", 
@@ -356,7 +414,8 @@ with col1:
                 # 解析待比对文件条款
                 clauses = parse_pdf_by_clauses(
                     file, 
-                    max_clauses=st.session_state.max_clauses
+                    max_clauses=st.session_state.max_clauses,
+                    precision=st.session_state.parse_precision
                 )
                 # 确保新文件的字典结构完整
                 st.session_state.compare_files[file.name] = {
@@ -486,22 +545,26 @@ with col2:
 # 帮助信息
 with st.expander("ℹ️ 使用帮助"):
     st.markdown("""
-    ### 工具特点
-    1. **按条款精确匹配**：只分析目标文件和待比对文件中编号相同的条款（如"第1条"）
-    2. **聚焦匹配内容**：未匹配的条款不会显示，只展示有对应关系的条款分析
-    3. **结构化分析**：对每条匹配条款进行合规性和差异性分析
-    4. **统一总结**：自动生成总体分析总结，提炼关键发现
+    ### 条款解析说明
+    系统采用多层次条款识别机制：
+    1. 优先识别"第X条"格式的标准条款
+    2. 如识别不足，自动尝试数字编号格式(1., 1.1等)
+    3. 可通过侧边栏调整解析精度：
+       - 宽松：提取更多可能的条款，适合格式不规范的文件
+       - 中等：平衡提取数量和准确性（默认）
+       - 严格：只提取明确符合格式的条款，适合规范文件
     
-    ### 使用方法
-    1. 上传目标政策文件（左侧）
-    2. 上传一个或多个待比对文件（左侧）
-    3. 为每个待比对文件点击"分析"按钮
-    4. 在右侧查看分析结果，包括总体总结和匹配条款详情
-    5. 可下载完整的Word格式分析报告
+    ### 使用流程
+    1. 上传目标政策文件和待比对文件
+    2. 可在侧边栏调整条款提取参数
+    3. 点击"分析"按钮进行条款匹配与分析
+    4. 查看总体总结和匹配条款的详细分析
+    5. 下载Word格式报告（可选）
     
-    ### 提示
-    - 为获得最佳匹配效果，请确保文件中条款以"第X条"格式明确编号
-    - 条款内容越清晰、结构越规范，分析结果越准确
-    - 分析结果仅包含匹配的条款，未匹配的条款不会显示
+    ### 提高解析效果的建议
+    - 确保PDF文件为可复制文本（非图片扫描件）
+    - 条款编号清晰的文件解析效果更佳
+    - 如提取条款不足，尝试调整为"宽松"解析精度
+    - 过长文件可适当增加最大条款数量限制
     """)
     
