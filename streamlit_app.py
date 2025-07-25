@@ -11,7 +11,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
 import numpy as np
-import requests  # 替换dashscope SDK，直接调用兼容API
+import requests
 import json
 from io import BytesIO
 
@@ -29,6 +29,8 @@ if 'bench_terms' not in st.session_state:
     st.session_state.bench_terms = []
 if 'comparison_terms' not in st.session_state:
     st.session_state.comparison_terms = {}
+if 'debug_mode' not in st.session_state:
+    st.session_state.debug_mode = False
 
 
 ### 1. 工具函数：文件解析与文本提取
@@ -43,7 +45,6 @@ def check_tesseract_installation():
 def has_selectable_text(page):
     """判断PDF页面是否为可选择文本（非图片）"""
     text = page.get_text("text").strip()
-    # 文本长度大于50字符认为是可选择文本
     return len(text) > 50
 
 def ocr_image(image):
@@ -73,19 +74,17 @@ def extract_text_from_pdf(pdf_path):
         tesseract_available = check_tesseract_installation()
         
         for page_num, page in enumerate(doc):
-            # 优先尝试文本提取
             if has_selectable_text(page):
                 page_text = page.get_text("text").strip()
-                text.append(f"[页面{page_num+1} 文本提取]\n{page_text}")
+                text.append(f"{page_text}")
             else:
-                # 文本提取失败且Tesseract可用时使用OCR
                 if tesseract_available:
                     pix = page.get_pixmap()
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_result = ocr_image(img)
-                    text.append(f"[页面{page_num+1} OCR识别]\n{ocr_result}")
+                    text.append(f"{ocr_result}")
                 else:
-                    text.append(f"[页面{page_num+1} 警告：无法提取文本（未安装Tesseract）]")
+                    text.append(f"[无法提取文本：未安装Tesseract]")
         
         doc.close()
         return "\n\n".join(text)
@@ -120,64 +119,108 @@ def extract_text_from_file(uploaded_file, file_type):
         else:
             return ""
     finally:
-        # 清理临时文件
         if 'temp_path' in locals() and os.path.exists(temp_path):
             os.unlink(temp_path)
 
 
-### 2. 中文条款拆分函数（增强版）
+### 2. 增强版中文条款拆分函数
 def split_chinese_terms(text):
-    """拆分中文条款（支持多种格式，增加异常处理）"""
+    """
+    增强版中文条款拆分，针对中文法律/合规文件特点优化
+    支持多种条款编号格式，提高拆分准确性
+    """
     # 输入验证
-    if not text or not isinstance(text, str):
-        st.warning("输入文本为空或无效，无法拆分条款")
+    if not text or not isinstance(text, str) or len(text.strip()) < 10:
+        st.warning("输入文本为空或太短，无法拆分条款")
         return []
     
-    # 预处理：清除多余空行和空格
-    text = re.sub(r'\s+', ' ', text)  # 统一空格
-    text = re.sub(r'([。；，,.])', r'\1 ', text)  # 标点后加空格便于拆分
+    # 调试模式：显示原始文本
+    if st.session_state.debug_mode:
+        with st.expander("查看原始文本（用于调试）"):
+            st.text_area("", text, height=200)
     
-    # 中文条款常见编号格式（正则模式）
+    # 文本预处理
+    processed_text = text
+    # 替换全角标点为半角，便于统一处理
+    processed_text = processed_text.replace('。', '.').replace('，', ',').replace('；', ';')
+    # 去除多余空行
+    processed_text = re.sub(r'\n+', '\n', processed_text.strip())
+    # 处理可能的连在一起的编号（如"1.条款内容2.条款内容"）
+    processed_text = re.sub(r'(\d+)\.([^\d])', r'\1.\n\2', processed_text)
+    processed_text = re.sub(r'(\d+)\.(\d+)\.', r'\1.\2.\n', processed_text)
+    
+    # 中文条款常见编号格式（增强版正则模式）
+    # 按优先级排序，更具体的模式排在前面
     patterns = [
-        r'(\d+\.\s+)',                # 1. 
-        r'(\d+\.\d+\s+)',             # 1.1 
-        r'(\(\d+\)\s+)',              # (1) 
-        r'([一二三四五六七八九十]+\、\s+)',  # 一、 
-        r'(第[一二三四五六七八九十]条\s+)',   # 第一条
-        r'(第[一二三四五六七八九十]款\s+)',   # 第一款
-        r'(\d+\)\s+)',                # 1)
-        r'([A-Za-z]\.\s+)',           # A. 
+        r'((?:第)?[一二三四五六七八九十百]+(?:条|款|项|点|节)\s*)',  # 第一条、第一款、第一项
+        r'((?:第)?\d+(?:条|款|项|点|节)\s*)',                          # 第1条、第1款、第1项
+        r'(\d+\.\d+\.\d+\s*)',                                          # 1.1.1 
+        r'(\d+\.\d+\s*)',                                                # 1.1 
+        r'(\d+\s*)',                                                     # 1 
+        r'([一二三四五六七八九十]+\、\s*)',                             # 一、二、
+        r'(\(\d+\)\s*)',                                                 # (1) (2)
+        r'(\(\D+\)\s*)',                                                 # (一) (二)
+        r'([A-Za-z]\.\s*)',                                              # A. B.
+        r'(\d+\)\s*)'                                                    # 1) 2)
     ]
-    combined_pattern = '|'.join(patterns)
+    
+    # 组合所有模式，使用正向前瞻确保只匹配作为开头的编号
+    combined_pattern = r'(?m)^(' + '|'.join(patterns).replace('(', '(?:') + ')'
     
     # 拆分文本并重组条款
-    parts = re.split(combined_pattern, text)
     terms = []
     current_term = ""
     
-    for part in parts:
-        if not part or not part.strip():  # 跳过空值
-            continue
-        
-        # 判断是否为条款编号
-        is_numbering = any(re.fullmatch(pattern.strip(), part.strip()) for pattern in patterns)
-        
-        if is_numbering:
-            if current_term.strip():  # 保存上一条款
-                terms.append(current_term.strip())
-            current_term = part  # 开始新条款
+    # 使用finditer找到所有匹配的编号位置
+    matches = list(re.finditer(combined_pattern, processed_text, re.MULTILINE))
+    
+    if not matches:
+        # 如果没有找到任何编号模式，尝试按空行拆分
+        st.info("未检测到标准条款编号格式，尝试按空行拆分")
+        raw_terms = re.split(r'\n\s*\n', processed_text)
+        return [term.strip() for term in raw_terms if term.strip()]
+    
+    # 处理第一个条款之前的内容（如果有）
+    first_match = matches[0]
+    if first_match.start() > 0:
+        prefix = processed_text[:first_match.start()].strip()
+        if prefix:
+            terms.append(prefix)
+    
+    # 处理所有匹配的条款
+    for i, match in enumerate(matches):
+        # 当前编号
+        numbering = match.group(0)
+        # 计算当前条款的结束位置
+        if i < len(matches) - 1:
+            end_pos = matches[i+1].start()
         else:
-            current_term += part  # 累加条款内容
+            end_pos = len(processed_text)
+        
+        # 提取条款内容
+        content = processed_text[match.end():end_pos].strip()
+        full_term = f"{numbering}{content}"
+        terms.append(full_term)
     
-    # 添加最后一条款
-    if current_term.strip():
-        terms.append(current_term.strip())
+    # 调试模式：显示拆分结果
+    if st.session_state.debug_mode:
+        with st.expander("查看条款拆分结果（用于调试）"):
+            for i, term in enumerate(terms):
+                st.write(f"条款{i+1}: {term[:100]}...")
     
-    # 拆分效果提示
-    if len(terms) < 3 and len(text) > 500:
-        st.info(f"检测到可能的条款拆分效果不佳（共{len(terms)}条），建议检查文件格式")
+    # 过滤过短的条款（可能是误拆分）
+    filtered_terms = []
+    for term in terms:
+        if len(term) > 10:  # 过滤掉长度小于10的条款
+            filtered_terms.append(term)
+        elif st.session_state.debug_mode:
+            st.warning(f"过滤短条款：{term}")
     
-    return terms
+    # 拆分效果评估
+    if len(filtered_terms) < 3 and len(processed_text) > 1000:
+        st.info(f"检测到可能的条款拆分效果不佳（共{len(filtered_terms)}条），建议检查文件格式")
+    
+    return filtered_terms
 
 
 ### 3. Qwen大模型调用（兼容模式API）
@@ -195,7 +238,7 @@ def call_qwen_api(prompt, api_key):
     payload = {
         "model": "qwen-plus",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3  # 低温度，保证结果稳定
+        "temperature": 0.3
     }
     
     try:
@@ -228,7 +271,7 @@ def analyze_terms_with_qwen(bench_term, compare_term, api_key):
     if error:
         return None, error
     
-    # 解析结果（简单提取分数和判断）
+    # 解析结果
     try:
         score_match = re.search(r'匹配度（0-100分）：(\d+)', result)
         score = int(score_match.group(1)) if score_match else 0
@@ -306,13 +349,14 @@ def generate_word_report(bench_terms, comparison_results, bench_filename):
 
 ### 5. 主函数
 def main():
-    st.title("📄 条款合规性对比工具（Qwen增强版）")
-    st.write("支持上传基准文件和多个对比文件（PDF/DOCX），自动分析条款合规性并生成报告")
+    st.title("📄 条款合规性对比工具（增强版）")
+    st.write("支持上传基准文件和多个对比文件（PDF/DOCX），优化了中文条款拆分效果")
     
     # 侧边栏配置
     with st.sidebar:
         st.subheader("配置")
         qwen_api_key = st.text_input("阿里云DashScope API密钥", type="password")
+        st.session_state.debug_mode = st.checkbox("启用调试模式", value=False)
         st.info("获取密钥：https://dashscope.console.aliyun.com/")
         st.divider()
         st.subheader("使用说明")
@@ -357,13 +401,12 @@ def main():
             non_compliant_terms = []
             
             with st.spinner(f"正在分析 {file_name} 的条款..."):
-                # 简化处理：一对一对比（实际可优化为相似度匹配）
                 min_terms = min(len(bench_terms), len(compare_terms))
                 for i in range(min_terms):
                     bench_term = bench_terms[i]
                     compare_term = compare_terms[i]
                     
-                    # 调用Qwen分析（无API密钥则跳过）
+                    # 调用Qwen分析
                     if qwen_api_key:
                         analysis, error = analyze_terms_with_qwen(bench_term, compare_term, qwen_api_key)
                         if error:
@@ -377,7 +420,7 @@ def main():
                             "compliance": "未知（需API密钥）"
                         }
                     
-                    # 分类：匹配度≥70分为可匹配
+                    # 分类
                     if analysis["score"] >= 70:
                         matched_terms.append({
                             "bench_term": bench_term,
@@ -418,3 +461,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
