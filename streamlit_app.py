@@ -95,7 +95,7 @@ if 'parse_precision' not in st.session_state:
 
 # 页面标题
 st.title("📜 条款式政策比对分析工具")
-st.markdown("仅识别'一、二、三……'和'（一）（二）（三）……'格式的条款")
+st.markdown("仅识别'一、二、三……'和'（一）（二）（三）……'格式的条款，自动跳过附件内容")
 st.markdown("---")
 
 # 条款提取设置
@@ -109,13 +109,6 @@ st.session_state.parse_precision = st.sidebar.select_slider(
     help="宽松：提取更多可能的条款；严格：只提取明确符合格式的条款"
 )
 
-# 表格过滤设置
-filter_tables = st.sidebar.checkbox(
-    "过滤表格内容",
-    value=True,
-    help="启用后将尝试识别并跳过PDF中的表格内容"
-)
-
 # API配置
 with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
     st.session_state.api_key = st.text_input("请输入Qwen API密钥", value=st.session_state.api_key, type="password")
@@ -126,77 +119,65 @@ with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
     )
     st.caption("提示：可从阿里云DashScope平台获取API密钥")
 
-# 辅助函数：判断文本是否可能来自表格
-def is_likely_table(text):
-    """判断文本是否可能来自表格，返回True表示可能是表格内容"""
+# 辅助函数：判断文本是否可能为附件内容
+def is_likely_attachment(text):
+    """判断文本是否可能为附件内容，返回True表示可能是附件"""
     if not text:
         return False
     
-    # 表格内容通常有以下特征：
-    # 1. 包含大量数字
-    digit_ratio = len(re.findall(r'\d', text)) / max(len(text), 1)
-    if digit_ratio > 0.3:  # 数字占比超过30%
+    # 附件通常有以下特征：
+    # 1. 包含附件标识关键词
+    attachment_keywords = ['附件', '附录', '附表', '附图', '附件一', '附录一', '附件列表']
+    for kw in attachment_keywords:
+        if kw in text:
+            # 检查关键词附近是否有关联表述
+            if re.search(f'{kw}[：: ]?[^\n]{0,20}(如下|如下所示|内容如下|包括|包含)', text):
+                return True
+    
+    # 2. 包含文件格式扩展名
+    file_extensions = r'\.(pdf|doc|docx|xls|xlsx|ppt|pptx|jpg|png|gif|zip|rar|txt)'
+    if re.search(file_extensions, text, re.IGNORECASE):
         return True
     
-    # 2. 包含大量分隔符/特殊字符
-    separator_chars = r'[|┃┆┇║+－=—_]'
-    separator_count = len(re.findall(separator_chars, text))
-    if separator_count > 3:  # 超过3个分隔符
+    # 3. 包含附件编号格式
+    if re.search(r'附件\s*[0-9一二三四五六七八九十]+[:：.、)]', text):
         return True
-    
-    # 3. 短句密集（表格单元格通常较短）
-    words = text.split()
-    if len(words) > 5 and sum(1 for word in words if len(word) < 5) / len(words) > 0.7:
-        return True
-    
-    # 4. 包含典型的表格标题关键词
-    table_keywords = ['序号', '编号', '名称', '单位', '数量', '金额', '备注', '合计', '小计']
-    keyword_count = sum(1 for kw in table_keywords if kw in text)
-    if keyword_count >= 2:  # 包含2个以上表格关键词
-        return True
-    
+        
     return False
 
-# 从1对1条款分析中整合的中文优化函数
-def extract_text_from_pdf(file, filter_tables=True):
-    """从PDF提取文本，优化中文处理，并可选择过滤表格内容"""
+# 文本提取函数，跳过附件内容
+def extract_text_from_pdf(file):
+    """从PDF提取文本，优化中文处理，跳过附件内容"""
     try:
         pdf_reader = PdfReader(file)
         text = ""
-        table_count = 0
+        attachment_count = 0
+        skip_mode = False  # 是否进入跳过模式
         
         for page in pdf_reader.pages:
             page_text = page.extract_text() or ""
             
-            # 如果需要过滤表格，先分割文本为段落再判断
-            if filter_tables:
-                # 简单分割段落（根据换行）
-                paragraphs = page_text.split('\n')
-                filtered_paragraphs = []
-                
-                for para in paragraphs:
-                    # 清理段落
-                    cleaned_para = para.strip().replace("  ", "")
-                    if not cleaned_para:
-                        continue
-                    
-                    # 判断是否为表格内容
-                    if is_likely_table(cleaned_para):
-                        table_count += 1
-                        continue  # 跳过表格内容
-                    
-                    filtered_paragraphs.append(cleaned_para)
-                
-                # 重新组合段落
-                page_text = "".join(filtered_paragraphs)
-            
             # 处理中文空格和换行问题
             page_text = page_text.replace("  ", "").replace("\n", "").replace("\r", "")
+            
+            # 检查是否包含附件标识
+            if not skip_mode and is_likely_attachment(page_text):
+                skip_mode = True
+                attachment_count += 1
+                continue  # 跳过当前页
+            
+            # 如果已进入跳过模式，检查是否需要退出
+            if skip_mode:
+                # 连续多页空白或低信息量可能表示附件结束
+                if len(page_text) < 50:
+                    skip_mode = False
+                continue  # 跳过附件页
+            
             text += page_text
         
-        # 提示过滤了多少表格内容
-        if filter_tables and table_count > 0:
-            st.info(f"已跳过 {table_count} 处可能的表格内容")
+        # 提示跳过了多少附件内容
+        if attachment_count > 0:
+            st.info(f"已跳过 {attachment_count} 处可能的附件内容")
             
         return text
     except Exception as e:
@@ -232,13 +213,13 @@ def chinese_text_similarity(text1, text2):
     # 计算分词后的相似度
     return SequenceMatcher(None, words1, words2).ratio()
 
-# 优化的PDF解析函数 - 解析特定格式条款
-def parse_pdf_by_clauses(file, precision="中等", filter_tables=True):
-    """解析PDF文件并提取特定格式条款，只识别'一、二、三'和'（一）（二）（三）'格式"""
+# PDF解析函数 - 解析特定格式条款，跳过附件
+def parse_pdf_by_clauses(file, precision="中等"):
+    """解析PDF文件并提取特定格式条款，只识别'一、二、三'和'（一）（二）（三）'格式，自动跳过附件"""
     try:
         with st.spinner("正在解析文件并拆分条款..."):
-            # 使用文本提取方法，加入表格过滤
-            full_text = extract_text_from_pdf(file, filter_tables=filter_tables)
+            # 使用文本提取方法，自动跳过附件
+            full_text = extract_text_from_pdf(file)
             total_pages = len(PdfReader(file).pages)  # 获取总页数
             
             # 文本预处理 - 增强条款识别
@@ -522,15 +503,14 @@ col1, col2 = st.columns([1, 2], gap="large")
 
 with col1:
     st.subheader("目标政策文件")
-    st.caption("作为基准的政策文件，系统将解析'一、二、三'和'（一）（二）（三）'格式的条款")
+    st.caption("作为基准的政策文件，系统将解析'一、二、三'和'（一）（二）（三）'格式的条款，自动跳过附件")
     target_file = st.file_uploader("上传目标政策文件 (PDF)", type="pdf", key="target")
     
     if target_file:
-        # 解析目标文件特定格式条款，应用表格过滤设置
+        # 解析目标文件特定格式条款，自动跳过附件
         st.session_state.target_clauses = parse_pdf_by_clauses(
             target_file, 
-            precision=st.session_state.parse_precision,
-            filter_tables=filter_tables
+            precision=st.session_state.parse_precision
         )
         
         with st.expander(f"查看提取的条款 (共 {len(st.session_state.target_clauses)} 条)"):
@@ -540,7 +520,7 @@ with col1:
     
     # 多文件上传区域
     st.subheader("待比对文件")
-    st.caption("可上传多个文件，系统将解析'一、二、三'和'（一）（二）（三）'格式的条款")
+    st.caption("可上传多个文件，系统将解析'一、二、三'和'（一）（二）（三）'格式的条款，自动跳过附件")
     compare_files = st.file_uploader(
         "上传待比对文件 (PDF)", 
         type="pdf", 
@@ -552,11 +532,10 @@ with col1:
     if compare_files:
         for file in compare_files:
             if file.name not in st.session_state.compare_files:
-                # 解析待比对文件特定格式条款，应用表格过滤设置
+                # 解析待比对文件特定格式条款，自动跳过附件
                 clauses = parse_pdf_by_clauses(
                     file, 
-                    precision=st.session_state.parse_precision,
-                    filter_tables=filter_tables
+                    precision=st.session_state.parse_precision
                 )
                 # 确保新文件的字典结构完整
                 st.session_state.compare_files[file.name] = {
@@ -651,6 +630,7 @@ with col2:
                     
                     for clause_num, details in matched_results.items():
                         st.markdown(f'#### 目标条款第{details["target_num"]}条 vs 待比对条款第{details["compare_num"]}条')
+                        st.markdown
                         st.markdown('<div class="matched-clause">', unsafe_allow_html=True)
                         
                         st.markdown("**目标条款内容：**")
@@ -700,7 +680,7 @@ with st.expander("ℹ️ 使用帮助"):
     st.markdown("""
     ### 工具特点
     1. **特定格式条款识别**：仅识别'一、二、三……'和'（一）（二）（三）……'格式的条款
-    2. **表格过滤功能**：自动识别并跳过PDF中的表格内容，提高条款识别准确性
+    2. **附件自动跳过**：自动识别并跳过PDF中的附件内容，提高条款识别准确性
     3. **双重匹配机制**：先按条款编号匹配，再按内容相似度匹配（中文优化）
     4. **合规性筛选**：仅对满足合规性要求的条款进行详细分析
     5. **数量控制**：最多展示前50条合规条款，保证分析效率
@@ -711,14 +691,8 @@ with st.expander("ℹ️ 使用帮助"):
     - 中文数字加顿号：如"一、"、"二、"、"三、"等
     - 带括号的中文数字：如"（一）"、"（二）"、"（三）"等
     
-    ### 合规判断标准
-    系统通过API分析自动判断条款合规性：
-    - 合规：待比对条款符合目标条款的核心要求
-    - 不合规：待比对条款与目标条款存在实质性差异
-    
-    ### 使用建议
-    - 确保目标文件包含符合上述格式的条款
-    - 对于包含大量条款的文件，系统会自动筛选合规条款并限制展示数量
-    - 分析结果中的总体总结基于所有合规条款生成，反映整体合规情况
-    """)
-    
+    ### 附件识别说明
+    系统通过以下特征识别并跳过附件内容：
+    - 包含"附件"、"附录"、"附表"等关键词
+    - 包含文件格式扩展名（如.pdf、.doc、.xls等）
+    - 包含附件编号格式
