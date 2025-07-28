@@ -210,10 +210,7 @@ def split_into_clauses(text):
         # 中文条款常见格式
         r'(第[一二三四五六七八九十百]+条\s+.*?)(?=第[一二三四五六七八九十百]+条\s+|$)',  # 第一条、第二条格式
         r'([一二三四五六七八九十]+、\s+.*?)(?=[一二三四五六七八九十]+、\s+|$)',  # 一、二、三、格式
-        r'(\d+\.\s+.*?)(?=\d+\.\s+|$)',  # 1. 2. 3. 格式
         r'(\([一二三四五六七八九十]+\)\s+.*?)(?=\([一二三四五六七八九十]+\)\s+|$)',  # (一) (二) 格式
-        r'(\([1-9]+\)\s+.*?)(?=\([1-9]+\)\s+|$)',  # (1) (2) 格式
-        r'(【[^\】]+】\s+.*?)(?=【[^\】]+】\s+|$)'  # 【标题】格式
     ]
     
     for pattern in patterns:
@@ -222,7 +219,7 @@ def split_into_clauses(text):
             return [clause.strip() for clause in clauses if clause.strip()]
     
     # 按中文标点分割段落
-    paragraphs = re.split(r'[。；！？]\s*', text)
+    paragraphs = re.split(r'[。！？]\s*', text)
     paragraphs = [p.strip() for p in paragraphs if p.strip() and len(p) > 10]  # 过滤过短内容
     return paragraphs
 
@@ -263,24 +260,16 @@ def parse_pdf_by_clauses(file, precision="中等", filter_tables=True):
                     num_match = re.search(r'第([一二三四五六七八九十百]+)条', clause)
                 elif re.search(r'[一二三四五六七八九十]+、', clause):
                     num_match = re.search(r'([一二三四五六七八九十]+)、', clause)
-                elif re.search(r'\d+\.', clause):
-                    num_match = re.search(r'(\d+)\.', clause)
                 elif re.search(r'\(([一二三四五六七八九十]+)\)', clause):
                     num_match = re.search(r'\(([一二三四五六七八九十]+)\)', clause)
-                elif re.search(r'\(([1-9]+)\)', clause):
-                    num_match = re.search(r'\(([1-9]+)\)', clause)
-                elif re.search(r'【[^\】]+】', clause):
-                    num_match = re.search(r'【([^\】]+)】', clause)
-                
+ 
                 if num_match:
                     clause_num = num_match.group(1)
                     # 清理条款内容，移除编号部分
                     clause_content = re.sub(r'^第[一二三四五六七八九十百]+条\s*', '', clause)
                     clause_content = re.sub(r'^[一二三四五六七八九十]+、\s*', '', clause_content)
-                    clause_content = re.sub(r'^\d+\.\s*', '', clause_content)
                     clause_content = re.sub(r'^\([一二三四五六七八九十]+\)\s*', '', clause_content)
-                    clause_content = re.sub(r'^\([1-9]+\)\s*', '', clause_content)
-                    clause_content = re.sub(r'^【[^\】]+】\s*', '', clause_content)
+
                 else:
                     clause_content = clause
                 
@@ -319,7 +308,7 @@ def call_qwen_api(prompt, api_key, model="qwen-turbo"):
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 1000
+                "max_tokens": 4000
             }
             
             response = requests.post(url, headers=headers, json=data, timeout=60)
