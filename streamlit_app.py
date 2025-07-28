@@ -1,5 +1,4 @@
 import streamlit as st
-import fitz  # PyMuPDF
 import re
 import time
 import requests
@@ -10,6 +9,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 import tempfile
 import os
 from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from difflib import SequenceMatcher
+import jieba  # 用于中文分词，提高匹配精度
 
 # 加载环境变量
 load_dotenv()
@@ -70,6 +72,12 @@ st.markdown("""
         border-radius: 3px;
         background-color: #f0f2f6;
     }
+    .highlight-conflict { background-color: #ffeeba; padding: 2px 4px; border-radius: 3px; }
+    .clause-box { border-left: 4px solid #007bff; padding: 10px; margin: 10px 0; background-color: #f8f9fa; }
+    .compliance-ok { border-left: 4px solid #28a745; }
+    .compliance-warning { border-left: 4px solid #ffc107; }
+    .compliance-conflict { border-left: 4px solid #dc3545; }
+    .model-response { background-color: #f0f2f6; padding: 15px; border-radius: 5px; margin: 10px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -111,113 +119,128 @@ with st.expander("🔑 API 配置", expanded=not st.session_state.api_key):
     )
     st.caption("提示：可从阿里云DashScope平台获取API密钥")
 
-# 优化的PDF解析函数 - 解析所有条款
+# 从1对1条款分析中整合的中文优化函数
+def extract_text_from_pdf(file):
+    """从PDF提取文本，优化中文处理"""
+    try:
+        pdf_reader = PdfReader(file)
+        text = ""
+        for page in pdf_reader.pages:
+            page_text = page.extract_text() or ""
+            # 处理中文空格和换行问题
+            page_text = page_text.replace("  ", "").replace("\n", "").replace("\r", "")
+            text += page_text
+        return text
+    except Exception as e:
+        st.error(f"提取文本失败: {str(e)}")
+        return ""
+
+def split_into_clauses(text):
+    """将文本分割为条款，增强中文条款识别"""
+    # 增强中文条款模式识别
+    patterns = [
+        # 中文条款常见格式
+        r'(第[一二三四五六七八九十百]+条\s+.*?)(?=第[一二三四五六七八九十百]+条\s+|$)',  # 第一条、第二条格式
+        r'([一二三四五六七八九十]+、\s+.*?)(?=[一二三四五六七八九十]+、\s+|$)',  # 一、二、三、格式
+        r'(\d+\.\s+.*?)(?=\d+\.\s+|$)',  # 1. 2. 3. 格式
+        r'(\([一二三四五六七八九十]+\)\s+.*?)(?=\([一二三四五六七八九十]+\)\s+|$)',  # (一) (二) 格式
+        r'(\([1-9]+\)\s+.*?)(?=\([1-9]+\)\s+|$)',  # (1) (2) 格式
+        r'(【[^\】]+】\s+.*?)(?=【[^\】]+】\s+|$)'  # 【标题】格式
+    ]
+    
+    for pattern in patterns:
+        clauses = re.findall(pattern, text, re.DOTALL)
+        if len(clauses) > 3:  # 确保找到足够多的条款
+            return [clause.strip() for clause in clauses if clause.strip()]
+    
+    # 按中文标点分割段落
+    paragraphs = re.split(r'[。；！？]\s*', text)
+    paragraphs = [p.strip() for p in paragraphs if p.strip() and len(p) > 10]  # 过滤过短内容
+    return paragraphs
+
+def chinese_text_similarity(text1, text2):
+    """计算中文文本相似度，使用分词后匹配"""
+    # 使用jieba进行中文分词
+    words1 = list(jieba.cut(text1))
+    words2 = list(jieba.cut(text2))
+    
+    # 计算分词后的相似度
+    return SequenceMatcher(None, words1, words2).ratio()
+
+# 优化的PDF解析函数 - 解析所有条款（整合1对1分析的中文处理）
 def parse_pdf_by_clauses(file, precision="中等"):
-    """解析PDF文件并提取所有条款，不限制数量"""
+    """解析PDF文件并提取所有条款，不限制数量，使用中文优化解析"""
     try:
         with st.spinner("正在解析文件并拆分所有条款..."):
-            doc = fitz.open(stream=file.read(), filetype="pdf")
-            total_pages = len(doc)
-            full_text = ""
-            
-            # 逐页读取文本，保留页面信息
-            for page_num, page in enumerate(doc, 1):
-                page_text = page.get_text()
-                # 清理页面文本并添加页分隔符
-                full_text += f"\n\n[[PAGE {page_num}]]\n{page_text}"
+            # 使用1对1分析中的文本提取方法
+            full_text = extract_text_from_pdf(file)
+            total_pages = len(PdfReader(file).pages)  # 获取总页数
             
             # 文本预处理 - 增强条款识别
             full_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', full_text)  # 移除控制字符
-            full_text = re.sub(r'(\r\n|\r|\n)+', '\n', full_text)  # 统一换行符
-            full_text = re.sub(r'[^\S\n]+', ' ', full_text)  # 替换非换行空白字符为空格
-            full_text = re.sub(r'(\d+)\.(\d+)', r'\1.\2', full_text)  # 修复数字间的点
-            full_text = full_text.strip()
+            full_text = re.sub(r'\s+', ' ', full_text).strip()  # 统一空白字符
             
-            # 根据精度选择不同的条款提取模式
+            # 使用1对1分析中的条款分割逻辑
+            clauses_list = split_into_clauses(full_text)
+            
+            # 为条款添加编号并过滤
             clauses = {}
-            
-            # 主要条款模式：第X条
-            primary_pattern = re.compile(r'(第[零一二三四五六七八九十百千\d]+\s*条\s+.*?)(?=第[零一二三四五六七八九十百千\d]+\s*条\s+|$)', re.DOTALL)
-            primary_matches = primary_pattern.findall(full_text)
-            
-            if primary_matches:
-                # 从主要模式提取条款
-                for match in primary_matches:
-                    clause_num_match = re.search(r'第([零一二三四五六七八九十百千\d]+)\s*条', match)
-                    if clause_num_match:
-                        clause_num = clause_num_match.group(1)
-                        # 清理条款内容
-                        clause_content = re.sub(r'第[零一二三四五六七八九十百千\d]+\s*条\s*', '', match).strip()
-                        # 移除页码标记
-                        clause_content = re.sub(r'\[\[PAGE \d+\]\]', '', clause_content)
-                        
-                        # 根据精度过滤条款
-                        if clause_content:
-                            if precision == "严格" and len(clause_content) > 50:
-                                clauses[clause_num] = clause_content
-                            elif precision == "中等" and len(clause_content) > 30:
-                                clauses[clause_num] = clause_content
-                            elif precision == "宽松" and len(clause_content) > 20:
-                                clauses[clause_num] = clause_content
-            
-            # 如果主要模式提取不足，尝试辅助模式
-            if not clauses or len(clauses) < 5:
-                st.markdown('<p class="parse-info">尝试其他条款格式提取...</p>', unsafe_allow_html=True)
+            for i, clause in enumerate(clauses_list, 1):
+                # 提取条款编号（如果有）
+                clause_num = str(i)  # 默认使用索引作为编号
+                num_match = None
                 
-                # 辅助模式1：数字编号 (1., 1.1, 1.1.1等)
-                alt_patterns = [
-                    re.compile(r'(\d+\.\d+\.\d+\s+.*?)(?=\d+\.\d+\.\d+\s+|$)', re.DOTALL),  # 三级
-                    re.compile(r'(\d+\.\d+\s+.*?)(?=\d+\.\d+\s+|$)', re.DOTALL),          # 二级
-                    re.compile(r'(\d+\s+.*?)(?=\d+\s+|$)', re.DOTALL)                     # 一级
-                ]
+                # 尝试从条款文本中提取编号
+                if re.search(r'第[一二三四五六七八九十百]+条', clause):
+                    num_match = re.search(r'第([一二三四五六七八九十百]+)条', clause)
+                elif re.search(r'[一二三四五六七八九十]+、', clause):
+                    num_match = re.search(r'([一二三四五六七八九十]+)、', clause)
+                elif re.search(r'\d+\.', clause):
+                    num_match = re.search(r'(\d+)\.', clause)
+                elif re.search(r'\([一二三四五六七八九十]+\)', clause):
+                    num_match = re.search(r'\(([一二三四五六七八九十]+)\)', clause)
+                elif re.search(r'\([1-9]+\)', clause):
+                    num_match = re.search(r'\(([1-9]+)\)', clause)
+                elif re.search(r'【[^\】]+】', clause):
+                    num_match = re.search(r'【([^\】]+)】', clause)
                 
-                for pattern in alt_patterns:
-                    alt_matches = pattern.findall(full_text)
-                    if alt_matches and len(alt_matches) > len(clauses):
-                        for i, match in enumerate(alt_matches):
-                            match = match.strip()
-                            if match:
-                                # 移除页码标记
-                                clean_match = re.sub(r'\[\[PAGE \d+\]\]', '', match)
-                                # 提取数字编号
-                                num_match = re.search(r'^(\d+(\.\d+)*)', clean_match)
-                                if num_match:
-                                    clause_num = num_match.group(1)
-                                    clause_content = re.sub(r'^\d+(\.\d+)*\s*', '', clean_match).strip()
-                                else:
-                                    clause_num = str(i+1)
-                                    clause_content = clean_match
-                                
-                                if clause_content:
-                                    clauses[clause_num] = clause_content
-                        if clauses:
-                            break
+                if num_match:
+                    clause_num = num_match.group(1)
+                    # 清理条款内容，移除编号部分
+                    clause_content = re.sub(r'^第[一二三四五六七八九十百]+条\s*', '', clause)
+                    clause_content = re.sub(r'^[一二三四五六七八九十]+、\s*', '', clause_content)
+                    clause_content = re.sub(r'^\d+\.\s*', '', clause_content)
+                    clause_content = re.sub(r'^\([一二三四五六七八九十]+\)\s*', '', clause_content)
+                    clause_content = re.sub(r'^\([1-9]+\)\s*', '', clause_content)
+                    clause_content = re.sub(r'^【[^\】]+】\s*', '', clause_content)
+                else:
+                    clause_content = clause
+                
+                # 根据精度过滤条款
+                if precision == "严格" and len(clause_content) > 50:
+                    clauses[clause_num] = clause_content.strip()
+                elif precision == "中等" and len(clause_content) > 30:
+                    clauses[clause_num] = clause_content.strip()
+                elif precision == "宽松" and len(clause_content) > 20:
+                    clauses[clause_num] = clause_content.strip()
             
-            # 最终过滤和整理
-            final_clauses = {}
-            for num, content in clauses.items():
-                # 移除多余空白和清理内容
-                cleaned = re.sub(r'\s+', ' ', content).strip()
-                if len(cleaned) > 20:  # 确保条款有足够内容
-                    final_clauses[num] = cleaned
-            
-            st.success(f"共解析 {total_pages} 页，成功提取 {len(final_clauses)} 条条款")
-            return final_clauses
+            st.success(f"共解析 {total_pages} 页，成功提取 {len(clauses)} 条条款")
+            return clauses
             
     except Exception as e:
         st.error(f"文件解析错误: {str(e)}")
         return {}
 
-# 调用Qwen API进行条款比对分析
+# 调用Qwen API进行条款比对分析（整合1对1分析的API调用方式）
 def call_qwen_api(prompt, api_key, model="qwen-turbo"):
-    """调用Qwen API进行条款比对分析"""
+    """调用Qwen API进行条款比对分析，使用优化的API请求格式"""
     if not api_key:
         st.error("请先配置API密钥")
         return None
     
     try:
         with st.spinner("正在分析条款..."):
-            url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+            url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
             
             headers = {
                 "Content-Type": "application/json",
@@ -226,25 +249,27 @@ def call_qwen_api(prompt, api_key, model="qwen-turbo"):
             
             data = {
                 "model": model,
-                "input": {
-                    "prompt": prompt
-                },
-                "parameters": {
-                    "temperature": 0.5,
-                    "top_p": 0.9,
-                    "max_tokens": 800
-                }
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 1000
             }
             
-            response = requests.post(url, headers=headers, data=json.dumps(data))
-            response_data = response.json()
+            response = requests.post(url, headers=headers, json=data, timeout=60)
             
-            if response.status_code == 200 and "output" in response_data:
-                return response_data["output"]["text"]
+            if response.status_code == 200:
+                response_data = response.json()
+                if "choices" in response_data and len(response_data["choices"]) > 0:
+                    return response_data["choices"][0]["message"]["content"]
+                else:
+                    st.error(f"API返回格式异常: {response_data}")
+                    return None
             else:
-                st.error(f"API调用失败: {response_data.get('message', '未知错误')}")
+                st.error(f"API调用失败: 状态码 {response.status_code}, 响应: {response.text}")
                 return None
                 
+    except requests.exceptions.Timeout:
+        st.error("API请求超时，请重试")
+        return None
     except Exception as e:
         st.error(f"API请求错误: {str(e)}")
         return None
@@ -261,8 +286,38 @@ def analyze_clause_matches(target_clauses, compare_clauses, api_key, model):
     total_matched = len(all_matched_clause_nums)
     
     if not all_matched_clause_nums:
-        st.info("未找到匹配的条款")
-        return {}, "未找到匹配的条款，无法进行合规性分析。", 0, total_matched
+        # 尝试基于内容相似度匹配（来自1对1分析的优化）
+        st.info("未找到编号匹配的条款，尝试基于内容相似度匹配...")
+        target_list = [(num, content) for num, content in target_clauses.items()]
+        compare_list = [(num, content) for num, content in compare_clauses.items()]
+        
+        matched_pairs = []
+        used_indices = set()
+        
+        for i, (t_num, t_content) in enumerate(target_list):
+            best_match = None
+            best_ratio = 0.3  # 中文匹配阈值
+            best_j = -1
+            
+            for j, (c_num, c_content) in enumerate(compare_list):
+                if j not in used_indices:
+                    ratio = chinese_text_similarity(t_content, c_content)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_match = (c_num, c_content)
+                        best_j = j
+            
+            if best_match:
+                matched_pairs.append((t_num, best_match[0], best_ratio))
+                used_indices.add(best_j)
+        
+        if matched_pairs:
+            all_matched_clause_nums = [(t_num, c_num) for t_num, c_num, _ in matched_pairs]
+            total_matched = len(matched_pairs)
+            st.info(f"基于内容相似度找到 {total_matched} 条可能匹配的条款")
+        else:
+            st.info("未找到匹配的条款")
+            return {}, "未找到匹配的条款，无法进行合规性分析。", 0, total_matched
     
     # 分析每个匹配的条款，筛选合规的
     compliant_results = {}
@@ -270,25 +325,32 @@ def analyze_clause_matches(target_clauses, compare_clauses, api_key, model):
     
     with st.spinner(f"正在分析 {total_matched} 条匹配条款，筛选合规条款..."):
         progress_bar = st.progress(0)
-        for i, clause_num in enumerate(all_matched_clause_nums):
-            target_content = target_clauses[clause_num]
-            compare_content = compare_clauses[clause_num]
+        for i, item in enumerate(all_matched_clause_nums):
+            # 处理两种匹配方式的结果
+            if isinstance(item, tuple):
+                t_num, c_num = item  # 相似度匹配的结果
+            else:
+                t_num = c_num = item  # 编号匹配的结果
+                
+            target_content = target_clauses[t_num]
+            compare_content = compare_clauses[c_num]
             
-            # 生成条款比对提示，特别要求判断合规性
+            # 生成条款比对提示，特别要求判断合规性（优化中文提示）
             prompt = f"""
-            请比对以下两条政策条款的合规性和差异：
+            请仔细分析以下两个中文条款的合规性：
             
-            目标条款（第{clause_num}条）：
+            目标条款（第{t_num}条）：
             {target_content[:300]}
             
-            待比对条款（第{clause_num}条）：
+            待比对条款（第{c_num}条）：
             {compare_content[:300]}
             
             分析要求：
             1. 首先明确判断待比对条款是否符合目标条款要求（用"合规"或"不合规"开头）
             2. 指出两者的主要差异点（如无差异则说明一致）
             3. 分析差异可能带来的影响
-            4. 用简洁的中文（不超过300字）输出分析结果
+            4. 注意中文法律/合同条款中常用表述的细微差别，如"应当"与"必须"、"不得"与"禁止"等
+            5. 用简洁的中文（不超过300字）输出分析结果
             """
             
             # 调用API分析
@@ -296,14 +358,18 @@ def analyze_clause_matches(target_clauses, compare_clauses, api_key, model):
             if result:
                 # 判断是否合规（基于API返回结果的开头）
                 if result.strip().startswith("合规"):
-                    compliant_results[clause_num] = {
+                    compliant_results[t_num] = {
+                        "target_num": t_num,
+                        "compare_num": c_num,
                         "target": target_content,
                         "compare": compare_content,
                         "analysis": result,
                         "compliant": True
                     }
                 else:
-                    non_compliant_results[clause_num] = {
+                    non_compliant_results[t_num] = {
+                        "target_num": t_num,
+                        "compare_num": c_num,
                         "target": target_content,
                         "compare": compare_content,
                         "analysis": result,
@@ -373,7 +439,7 @@ def generate_word_document(matched_results, summary, target_filename, compare_fi
         doc.add_heading("二、合规条款详细分析", level=1)
         
         for clause_num, details in matched_results.items():
-            doc.add_heading(f"第{clause_num}条", level=2)
+            doc.add_heading(f"目标条款第{details['target_num']}条 vs 待比对条款第{details['compare_num']}条", level=2)
             
             p = doc.add_paragraph("目标条款内容：")
             p.style = 'Heading 3'
@@ -420,7 +486,7 @@ with col1:
     
     # 多文件上传区域
     st.subheader("待比对文件")
-    st.caption("可上传多个文件，系统将解析所有条款并按编号匹配")
+    st.caption("可上传多个文件，系统将解析所有条款并按编号或内容匹配")
     compare_files = st.file_uploader(
         "上传待比对文件 (PDF)", 
         type="pdf", 
@@ -529,7 +595,7 @@ with col2:
                     st.markdown(f"### 🔍 合规条款详情 ({len(matched_results)} 条)")
                     
                     for clause_num, details in matched_results.items():
-                        st.markdown(f'#### 第{clause_num}条')
+                        st.markdown(f'#### 目标条款第{details["target_num"]}条 vs 待比对条款第{details["compare_num"]}条')
                         st.markdown('<div class="matched-clause">', unsafe_allow_html=True)
                         
                         st.markdown("**目标条款内容：**")
@@ -579,9 +645,10 @@ with st.expander("ℹ️ 使用帮助"):
     st.markdown("""
     ### 工具特点
     1. **全量条款解析**：解析文件中所有符合格式的条款，不设数量限制
-    2. **合规性筛选**：仅对满足合规性要求的条款进行详细分析
-    3. **数量控制**：最多展示前50条合规条款，保证分析效率
-    4. **清晰统计**：显示总匹配条款数与合规条款数的统计信息
+    2. **双重匹配机制**：先按条款编号匹配，再按内容相似度匹配（中文优化）
+    3. **合规性筛选**：仅对满足合规性要求的条款进行详细分析
+    4. **数量控制**：最多展示前50条合规条款，保证分析效率
+    5. **清晰统计**：显示总匹配条款数与合规条款数的统计信息
     
     ### 合规判断标准
     系统通过API分析自动判断条款合规性：
@@ -593,4 +660,3 @@ with st.expander("ℹ️ 使用帮助"):
     - 对于包含大量条款的文件，系统会自动筛选合规条款并限制展示数量
     - 分析结果中的总体总结基于所有合规条款生成，反映整体合规情况
     """)
-    
