@@ -95,7 +95,7 @@ if 'parse_precision' not in st.session_state:
 
 # 页面标题
 st.title("📜 条款式政策比对分析工具")
-st.markdown("解析所有条款，仅分析满足合规性匹配的前50条（已优化：跳过表格内容）")
+st.markdown("仅识别'一、二、三……'和'（一）（二）（三）……'格式的条款")
 st.markdown("---")
 
 # 条款提取设置
@@ -204,24 +204,24 @@ def extract_text_from_pdf(file, filter_tables=True):
         return ""
 
 def split_into_clauses(text):
-    """将文本分割为条款，增强中文条款识别"""
-    # 增强中文条款模式识别
+    """将文本分割为条款，仅识别'一、二、三……'和'（一）（二）（三）……'格式"""
+    # 只保留两种格式的条款识别：
+    # 1. 一、二、三、……格式
+    # 2. （一）（二）（三）……格式
+    
+    # 先尝试匹配带括号的格式（优先级稍高，因为可能是子条款）
     patterns = [
-        # 中文条款常见格式
-        r'(第[一二三四五六七八九十百]+条\s+.*?)(?=第[一二三四五六七八九十百]+条\s+|$)',  # 第一条、第二条格式
-        r'([一二三四五六七八九十]+、\s+.*?)(?=[一二三四五六七八九十]+、\s+|$)',  # 一、二、三、格式
-        r'(\([一二三四五六七八九十]+\)\s+.*?)(?=\([一二三四五六七八九十]+\)\s+|$)',  # (一) (二) 格式
+        r'(\([一二三四五六七八九十]+\)\s+.*?)(?=\([一二三四五六七八九十]+\)\s+|$)',  # （一）（二）格式
+        r'([一二三四五六七八九十]+、\s+.*?)(?=[一二三四五六七八九十]+、\s+|$)'  # 一、二、三、格式
     ]
     
     for pattern in patterns:
         clauses = re.findall(pattern, text, re.DOTALL)
-        if len(clauses) > 3:  # 确保找到足够多的条款
+        if len(clauses) > 0:  # 找到符合条件的条款
             return [clause.strip() for clause in clauses if clause.strip()]
     
-    # 按中文标点分割段落
-    paragraphs = re.split(r'[。！？]\s*', text)
-    paragraphs = [p.strip() for p in paragraphs if p.strip() and len(p) > 10]  # 过滤过短内容
-    return paragraphs
+    # 如果没有找到任何符合条件的条款，返回空列表
+    return []
 
 def chinese_text_similarity(text1, text2):
     """计算中文文本相似度，使用分词后匹配"""
@@ -232,12 +232,12 @@ def chinese_text_similarity(text1, text2):
     # 计算分词后的相似度
     return SequenceMatcher(None, words1, words2).ratio()
 
-# 优化的PDF解析函数 - 解析所有条款（整合1对1分析的中文处理）
+# 优化的PDF解析函数 - 解析特定格式条款
 def parse_pdf_by_clauses(file, precision="中等", filter_tables=True):
-    """解析PDF文件并提取所有条款，不限制数量，使用中文优化解析，可选择过滤表格"""
+    """解析PDF文件并提取特定格式条款，只识别'一、二、三'和'（一）（二）（三）'格式"""
     try:
-        with st.spinner("正在解析文件并拆分所有条款..."):
-            # 使用1对1分析中的文本提取方法，加入表格过滤
+        with st.spinner("正在解析文件并拆分条款..."):
+            # 使用文本提取方法，加入表格过滤
             full_text = extract_text_from_pdf(file, filter_tables=filter_tables)
             total_pages = len(PdfReader(file).pages)  # 获取总页数
             
@@ -245,33 +245,29 @@ def parse_pdf_by_clauses(file, precision="中等", filter_tables=True):
             full_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', full_text)  # 移除控制字符
             full_text = re.sub(r'\s+', ' ', full_text).strip()  # 统一空白字符
             
-            # 使用1对1分析中的条款分割逻辑
+            # 使用特定格式的条款分割逻辑
             clauses_list = split_into_clauses(full_text)
             
             # 为条款添加编号并过滤
             clauses = {}
-            for i, clause in enumerate(clauses_list, 1):
-                # 提取条款编号（如果有）
-                clause_num = str(i)  # 默认使用索引作为编号
+            for clause in clauses_list:
+                # 提取条款编号（只处理指定的两种格式）
                 num_match = None
                 
                 # 尝试从条款文本中提取编号
-                if re.search(r'第[一二三四五六七八九十百]+条', clause):
-                    num_match = re.search(r'第([一二三四五六七八九十百]+)条', clause)
+                if re.search(r'\([一二三四五六七八九十]+\)', clause):
+                    num_match = re.search(r'\(([一二三四五六七八九十]+)\)', clause)
                 elif re.search(r'[一二三四五六七八九十]+、', clause):
                     num_match = re.search(r'([一二三四五六七八九十]+)、', clause)
-                elif re.search(r'\(([一二三四五六七八九十]+)\)', clause):
-                    num_match = re.search(r'\(([一二三四五六七八九十]+)\)', clause)
- 
+                
                 if num_match:
                     clause_num = num_match.group(1)
                     # 清理条款内容，移除编号部分
-                    clause_content = re.sub(r'^第[一二三四五六七八九十百]+条\s*', '', clause)
+                    clause_content = re.sub(r'^\([一二三四五六七八九十]+\)\s*', '', clause)
                     clause_content = re.sub(r'^[一二三四五六七八九十]+、\s*', '', clause_content)
-                    clause_content = re.sub(r'^\([一二三四五六七八九十]+\)\s*', '', clause_content)
-
                 else:
-                    clause_content = clause
+                    # 不应该走到这里，因为split_into_clauses已经过滤了格式
+                    continue
                 
                 # 根据精度过滤条款
                 if precision == "严格" and len(clause_content) > 50:
@@ -281,14 +277,14 @@ def parse_pdf_by_clauses(file, precision="中等", filter_tables=True):
                 elif precision == "宽松" and len(clause_content) > 20:
                     clauses[clause_num] = clause_content.strip()
             
-            st.success(f"共解析 {total_pages} 页，成功提取 {len(clauses)} 条条款")
+            st.success(f"共解析 {total_pages} 页，成功提取 {len(clauses)} 条符合格式的条款")
             return clauses
             
     except Exception as e:
         st.error(f"文件解析错误: {str(e)}")
         return {}
 
-# 调用Qwen API进行条款比对分析（整合1对1分析的API调用方式）
+# 调用Qwen API进行条款比对分析
 def call_qwen_api(prompt, api_key, model="qwen-turbo"):
     """调用Qwen API进行条款比对分析，使用优化的API请求格式"""
     if not api_key:
@@ -308,7 +304,7 @@ def call_qwen_api(prompt, api_key, model="qwen-turbo"):
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 4000
+                "max_tokens": 1000
             }
             
             response = requests.post(url, headers=headers, json=data, timeout=60)
@@ -343,7 +339,7 @@ def analyze_clause_matches(target_clauses, compare_clauses, api_key, model):
     total_matched = len(all_matched_clause_nums)
     
     if not all_matched_clause_nums:
-        # 尝试基于内容相似度匹配（来自1对1分析的优化）
+        # 尝试基于内容相似度匹配
         st.info("未找到编号匹配的条款，尝试基于内容相似度匹配...")
         target_list = [(num, content) for num, content in target_clauses.items()]
         compare_list = [(num, content) for num, content in compare_clauses.items()]
@@ -392,7 +388,7 @@ def analyze_clause_matches(target_clauses, compare_clauses, api_key, model):
             target_content = target_clauses[t_num]
             compare_content = compare_clauses[c_num]
             
-            # 生成条款比对提示，特别要求判断合规性（优化中文提示）
+            # 生成条款比对提示，特别要求判断合规性
             prompt = f"""
             请仔细分析以下两个中文条款的合规性：
             
@@ -526,25 +522,25 @@ col1, col2 = st.columns([1, 2], gap="large")
 
 with col1:
     st.subheader("目标政策文件")
-    st.caption("作为基准的政策文件，系统将解析所有条款")
+    st.caption("作为基准的政策文件，系统将解析'一、二、三'和'（一）（二）（三）'格式的条款")
     target_file = st.file_uploader("上传目标政策文件 (PDF)", type="pdf", key="target")
     
     if target_file:
-        # 解析目标文件所有条款，应用表格过滤设置
+        # 解析目标文件特定格式条款，应用表格过滤设置
         st.session_state.target_clauses = parse_pdf_by_clauses(
             target_file, 
             precision=st.session_state.parse_precision,
             filter_tables=filter_tables
         )
         
-        with st.expander(f"查看提取的所有条款 (共 {len(st.session_state.target_clauses)} 条)"):
+        with st.expander(f"查看提取的条款 (共 {len(st.session_state.target_clauses)} 条)"):
             for num, content in st.session_state.target_clauses.items():
                 display_text = content[:150] + "..." if len(content) > 150 else content
                 st.markdown(f'<div class="clause-item"><strong>第{num}条:</strong> {display_text}</div>', unsafe_allow_html=True)
     
     # 多文件上传区域
     st.subheader("待比对文件")
-    st.caption("可上传多个文件，系统将解析所有条款并按编号或内容匹配")
+    st.caption("可上传多个文件，系统将解析'一、二、三'和'（一）（二）（三）'格式的条款")
     compare_files = st.file_uploader(
         "上传待比对文件 (PDF)", 
         type="pdf", 
@@ -556,7 +552,7 @@ with col1:
     if compare_files:
         for file in compare_files:
             if file.name not in st.session_state.compare_files:
-                # 解析待比对文件所有条款，应用表格过滤设置
+                # 解析待比对文件特定格式条款，应用表格过滤设置
                 clauses = parse_pdf_by_clauses(
                     file, 
                     precision=st.session_state.parse_precision,
@@ -570,7 +566,7 @@ with col1:
                     "total_compliant": 0,  # 合规条款总数
                     "total_matched": 0     # 总匹配条款数
                 }
-                st.success(f"✅ 已添加 {file.name}，提取到 {len(clauses)} 条条款")
+                st.success(f"✅ 已添加 {file.name}，提取到 {len(clauses)} 条符合格式的条款")
     
     # 显示已上传的待比对文件列表
     if st.session_state.compare_files:
@@ -703,18 +699,17 @@ with col2:
 with st.expander("ℹ️ 使用帮助"):
     st.markdown("""
     ### 工具特点
-    1. **全量条款解析**：解析文件中所有符合格式的条款，不设数量限制
+    1. **特定格式条款识别**：仅识别'一、二、三……'和'（一）（二）（三）……'格式的条款
     2. **表格过滤功能**：自动识别并跳过PDF中的表格内容，提高条款识别准确性
     3. **双重匹配机制**：先按条款编号匹配，再按内容相似度匹配（中文优化）
     4. **合规性筛选**：仅对满足合规性要求的条款进行详细分析
     5. **数量控制**：最多展示前50条合规条款，保证分析效率
     6. **清晰统计**：显示总匹配条款数与合规条款数的统计信息
     
-    ### 表格识别说明
-    系统通过以下特征识别表格内容：
-    - 包含大量数字（占比超过30%）
-    - 包含多个表格分隔符（如|、┃、+等）
-    - 短句密集且包含多个表格关键词（如序号、名称、数量等）
+    ### 条款识别说明
+    系统仅识别以下两种格式的条款：
+    - 中文数字加顿号：如"一、"、"二、"、"三、"等
+    - 带括号的中文数字：如"（一）"、"（二）"、"（三）"等
     
     ### 合规判断标准
     系统通过API分析自动判断条款合规性：
@@ -722,7 +717,8 @@ with st.expander("ℹ️ 使用帮助"):
     - 不合规：待比对条款与目标条款存在实质性差异
     
     ### 使用建议
-    - 确保目标文件条款清晰，便于系统准确识别匹配关系
+    - 确保目标文件包含符合上述格式的条款
     - 对于包含大量条款的文件，系统会自动筛选合规条款并限制展示数量
     - 分析结果中的总体总结基于所有合规条款生成，反映整体合规情况
     """)
+    
